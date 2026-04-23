@@ -15,6 +15,7 @@ from agno.models.ollama import Ollama
 CPU_THREADS = os.cpu_count() or 1
 MAX_MEMORY_CHARS = 500
 RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma2:2b")
+# RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma4:e2b")
 DEFAULT_TRAIN_STEPS = 5
 DEFAULT_MAX_SEQ_LEN = 512
 
