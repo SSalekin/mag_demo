@@ -1,25 +1,47 @@
+import logging
 import os
 import queue
 import threading
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 
-
-# -----------------------------
-# Runtime configuration
-# -----------------------------
 CPU_THREADS = os.cpu_count() or 1
-MAX_MEMORY_CHARS = 500
+MAX_MEMORY_CHARS = 10000000
 RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma2:2b")
-# RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma4:e2b")
-DEFAULT_TRAIN_STEPS = 5
+DEFAULT_TRAIN_STEPS = 100
 DEFAULT_MAX_SEQ_LEN = 512
+DEFAULT_CHECKPOINT_PATH = "neural_memory.pt"
+TRAINING_LOG_PATH = "training_worker.log"
 
-# Use all available CPU threads for transformer training/inference when possible.
+_training_logger: Optional[logging.Logger] = None
+
+
+def _get_training_logger() -> logging.Logger:
+    global _training_logger
+    if _training_logger is not None:
+        return _training_logger
+    log = logging.getLogger("transformer_implementation.training_worker")
+    log.setLevel(logging.INFO)
+    if not log.handlers:
+        file_handler = logging.FileHandler(
+            TRAINING_LOG_PATH, encoding="utf-8"
+        )
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        log.addHandler(file_handler)
+    log.propagate = False
+    _training_logger = log
+    return log
+
+
 torch.set_num_threads(CPU_THREADS)
 if hasattr(torch, "set_num_interop_threads"):
     torch.set_num_interop_threads(CPU_THREADS)
@@ -29,7 +51,6 @@ class NeuralMemory(nn.Module):
     def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
         super().__init__()
 
-        # ASCII + control tokens for sequence generation.
         self.special_tokens = ["<BOS>", "<EOS>", "<UNK>"]
         self.ascii_tokens = [chr(i) for i in range(32, 127)]
         self.vocab = self.special_tokens + self.ascii_tokens
@@ -86,7 +107,6 @@ class NeuralMemory(nn.Module):
         return merged_memory
 
     def update(self, fact: str, train_steps: int = DEFAULT_TRAIN_STEPS) -> str:
-        """Append fact to transformer memory and retrain next-token prediction."""
         clean_fact = fact.strip()
         if not clean_fact:
             return "Memory update skipped: empty fact."
@@ -125,13 +145,14 @@ class NeuralMemory(nn.Module):
 
         return f"Memory Updated. Loss: {loss.item():.4f}" if loss is not None else "Memory update skipped."
 
-    def recall(self, max_len: int = 220, deterministic: bool = True) -> str:
-        """Recall memory text from facts or decode with transformer generation."""
-        if self.facts:
-            return self._compose_memory_text()
-
-        if deterministic:
-            return self.training_text or "No transformer memory encoded yet."
+    def recall(
+        self,
+        user_message: str = "",
+        max_len: int = 100000,
+        deterministic: bool = True,
+    ) -> str:
+        _ = user_message
+        _ = deterministic
 
         self.eval()
         generated_ids: List[int] = []
@@ -160,9 +181,6 @@ class NeuralMemory(nn.Module):
         return decoded if decoded else "Neural memory decode returned empty text."
 
 
-# -----------------------------
-# App state
-# -----------------------------
 brain = NeuralMemory()
 brain_lock = threading.Lock()
 training_queue: "queue.Queue[str]" = queue.Queue()
@@ -173,51 +191,54 @@ latest_recalled_text = "No transformer memory encoded yet."
 
 
 def write_to_neural_memory(fact: str) -> str:
-    """Queue a fact for async transformer memory training."""
     training_queue.put(fact)
     return "Transformer training queued in background."
 
 
-def read_from_neural_memory() -> str:
-    """Read cached neural memory without blocking user response path."""
+def read_from_neural_memory(user_message: str = "") -> str:
     global latest_memory_text, latest_recalled_text
 
-    # Try refresh snapshot opportunistically; skip if trainer holds the lock.
     if brain_lock.acquire(blocking=False):
         try:
             latest_memory_text = brain._compose_memory_text(
             ) if brain.facts else brain.training_text
-            latest_recalled_text = brain.recall()
+            latest_recalled_text = brain.recall(user_message=user_message)
+            print("Latest MEMORY:", latest_recalled_text)
         finally:
             brain_lock.release()
 
-    memory_text = latest_memory_text[-MAX_MEMORY_CHARS:]
-    recalled_text = latest_recalled_text[-MAX_MEMORY_CHARS:]
+    memory_text = latest_recalled_text[-MAX_MEMORY_CHARS:]
     return (
         f"Transformer Memory Text: {memory_text if memory_text else '[empty]'}\n"
-        f"Recalled Fact From Transformer: {recalled_text}"
+
     )
 
 
 def _training_worker() -> None:
     global latest_training_status, latest_memory_text, latest_recalled_text
 
+    log = _get_training_logger()
+    log.info("Training worker started.")
+
     while True:
         fact = training_queue.get()
+        log.info("Dequeued training item: %r", fact)
         if fact is None:
+            log.info("Received shutdown sentinel; exiting training worker loop.")
             training_queue.task_done()
             break
 
         try:
+            log.info("Starting neural memory update for fact.")
             with brain_lock:
                 latest_training_status = brain.update(fact)
-                latest_memory_text = brain._compose_memory_text(
-                ) if brain.facts else brain.training_text
-                latest_recalled_text = brain.recall()
+            log.info("Training update finished: %s", latest_training_status)
         except Exception as err:
             latest_training_status = f"Background training failed: {err}"
+            log.exception("Background training failed: %s", err)
         finally:
             training_queue.task_done()
+            log.info("Marked training queue item as done.")
 
 
 def _start_training_worker() -> None:
@@ -239,7 +260,6 @@ response_agent = Agent(
 
 
 def _should_memorize(user_message: str) -> bool:
-    """Simple heuristic for autobiographical facts worth writing to memory."""
     lower = user_message.lower()
     blocked_markers = ["?", "don't save", "dont save",
                        "forget", "don't remember", "dont remember"]
@@ -253,7 +273,7 @@ def _should_memorize(user_message: str) -> bool:
 
 def _queue_memorize_if_needed(user_message: str) -> None:
     if _should_memorize(user_message):
-        # Keep response path strictly non-blocking.
+
         threading.Thread(
             target=write_to_neural_memory,
             args=(user_message,),
@@ -263,11 +283,10 @@ def _queue_memorize_if_needed(user_message: str) -> None:
 
 
 def _answer_with_memory_context(user_message: str) -> None:
-    memory_snapshot = read_from_neural_memory()
-    training_status = f"Queue length: {training_queue.qsize()} | Last training status: {latest_training_status}"
+    memory_snapshot = read_from_neural_memory(user_message=user_message)
+
     grounded_prompt = (
         "Answer briefly using this memory snapshot.\n\n"
-        f"Training Status: {training_status}\n"
         f"{memory_snapshot}\n\n"
         f"User message: {user_message}"
     )
@@ -276,13 +295,11 @@ def _answer_with_memory_context(user_message: str) -> None:
 
 
 def run_seed_demo() -> None:
-    """Seed neural memory in background without LLM response calls."""
     seed_facts = [
         "My name is Salekin",
         "I was born in December 1991",
         "I am a student of Greenwich Danang",
-        "I am working on a reasearch paper about Memory Augmented Generation",
-        "Remember, I live in Danang city and Better Call Saul is the best tv show ever.",
+        "I am living in Danang",
         "Danang is the most beautiful city of Vietnam.",
     ]
     for fact in seed_facts:
@@ -293,6 +310,37 @@ def _start_seed_demo() -> None:
     thread = threading.Thread(target=run_seed_demo,
                               daemon=True, name="seed-demo")
     thread.start()
+
+
+def save_neural_memory_checkpoint(path: str = DEFAULT_CHECKPOINT_PATH) -> str:
+    checkpoint = {
+        "model_state": brain.state_dict(),
+        "optimizer_state": brain.optimizer.state_dict(),
+        "facts": list(brain.facts),
+        "training_text": brain.training_text,
+        "max_seq_len": brain.max_seq_len,
+        "vocab": list(brain.vocab),
+    }
+    torch.save(checkpoint, path)
+    return path
+
+
+def load_neural_memory_checkpoint(path: str = DEFAULT_CHECKPOINT_PATH) -> str:
+    global latest_memory_text, latest_recalled_text
+
+    checkpoint = torch.load(path, map_location="cpu")
+    brain.load_state_dict(checkpoint["model_state"])
+
+    optimizer_state = checkpoint.get("optimizer_state")
+    if optimizer_state:
+        brain.optimizer.load_state_dict(optimizer_state)
+
+    brain.facts = list(checkpoint.get("facts", []))
+    brain.training_text = checkpoint.get("training_text", "")
+    latest_memory_text = brain._compose_memory_text(
+    ) if brain.facts else brain.training_text
+    latest_recalled_text = brain.recall()
+    return path
 
 
 def run_chat() -> None:
@@ -307,6 +355,11 @@ def run_chat() -> None:
         if not user_message:
             continue
         if user_message.lower() in {"exit", "quit"}:
+
+            training_queue.join()
+            with brain_lock:
+                checkpoint_path = save_neural_memory_checkpoint()
+            print(f"Saved neural memory checkpoint to {checkpoint_path}.")
             print("Exiting chat.")
             break
 
@@ -315,5 +368,10 @@ def run_chat() -> None:
 
 if __name__ == "__main__":
     _start_training_worker()
-    _start_seed_demo()
+    if os.path.exists(DEFAULT_CHECKPOINT_PATH):
+        with brain_lock:
+            checkpoint_path = load_neural_memory_checkpoint()
+        print(f"Loaded neural memory checkpoint from {checkpoint_path}.")
+    else:
+        _start_seed_demo()
     run_chat()
