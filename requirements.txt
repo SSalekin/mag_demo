@@ -1,3 +1,4 @@
 torch
 agno
 ollama
+transformers

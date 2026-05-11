@@ -10,10 +10,10 @@ from agno.agent import Agent
 from agno.models.ollama import Ollama
 
 CPU_THREADS = os.cpu_count() or 1
-MAX_MEMORY_CHARS = 10000000
+MAX_MEMORY_CHARS = 4096
 RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma2:2b")
 DEFAULT_TRAIN_STEPS = 100
-DEFAULT_MAX_SEQ_LEN = 512
+DEFAULT_MAX_SEQ_LEN = 1024
 DEFAULT_CHECKPOINT_PATH = "neural_memory.pt"
 TRAINING_LOG_PATH = "training_worker.log"
 

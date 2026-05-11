@@ -1,11 +1,11 @@
 """
-Neural memory demo using Google's Titans-style architecture
-(Titans: Learning to Memorize at Test Time, Behrouz et al., Google Research).
+Neural memory demo using a Mamba-style selective state-space sequence model
+(Mamba: Linear-Time Sequence Modeling with Selective State Spaces, Gu & Dao).
 
-Short-term: causal self-attention over the current sequence.
-Long-term: deep MLP memory trained with an associative objective at test time
-(||M(k) - v||^2 with momentum-style accumulation simplified here).
+Core: causal depthwise conv + selective SSM scan (no cross-token attention).
 """
+
+from __future__ import annotations
 
 import logging
 import os
@@ -23,9 +23,8 @@ CPU_THREADS = os.cpu_count() or 1
 MAX_MEMORY_CHARS = 4096
 RESPONSE_MODEL_ID = os.getenv("RESPONSE_MODEL_ID", "gemma2:2b")
 DEFAULT_TRAIN_STEPS = 50
-DEFAULT_INNER_MEMORY_STEPS = 50
 DEFAULT_MAX_SEQ_LEN = 1024
-DEFAULT_CHECKPOINT_PATH = "neural_memory.pt"
+DEFAULT_CHECKPOINT_PATH = "mamba_neural_memory.pt"
 TRAINING_LOG_PATH = "training_worker.log"
 
 _training_logger: Optional[logging.Logger] = None
@@ -35,7 +34,7 @@ def _get_training_logger() -> logging.Logger:
     global _training_logger
     if _training_logger is not None:
         return _training_logger
-    log = logging.getLogger("titan_implementation.training_worker")
+    log = logging.getLogger("mamba_implementation.training_worker")
     log.setLevel(logging.INFO)
     if not log.handlers:
         file_handler = logging.FileHandler(
@@ -58,66 +57,93 @@ if hasattr(torch, "set_num_interop_threads"):
     torch.set_num_interop_threads(CPU_THREADS)
 
 
-class NeuralLongTermMemory(nn.Module):
-    """Associative long-term memory M(k) ≈ v (Titans §3.1), implemented as an MLP."""
+class SelectiveSSM(nn.Module):
+    """
+    Diagonal selective SSM with per-channel state (Mamba-style discretization).
+    Sequential scan: O(L * E * N); fine for demo sequence lengths.
+    """
 
-    def __init__(self, d_model: int):
+    def __init__(self, d_inner: int, d_state: int = 16):
         super().__init__()
-        self.proj_k = nn.Linear(d_model, d_model, bias=False)
-        self.proj_v = nn.Linear(d_model, d_model, bias=False)
-        self.proj_q = nn.Linear(d_model, d_model, bias=False)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 2),
-            nn.GELU(),
-            nn.Linear(d_model * 2, d_model),
-        )
+        self.d_inner = d_inner
+        self.d_state = d_state
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).view(1, -1).repeat(d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A.clamp(min=1e-4)))
+        self.dt_proj = nn.Linear(d_inner, d_inner)
+        self.B_proj = nn.Linear(d_inner, d_inner * d_state, bias=False)
+        self.C_proj = nn.Linear(d_inner, d_inner * d_state, bias=False)
+        self.D_skip = nn.Parameter(torch.ones(d_inner))
 
-    def associative_loss(self, x: torch.Tensor) -> torch.Tensor:
-        """ℓ(M; x) = ||M(k) - v||^2 averaged over positions."""
-        k = self.proj_k(x)
-        v = self.proj_v(x)
-        pred = self.mlp(k)
-        return F.mse_loss(pred, v)
+    def forward(self, u: torch.Tensor) -> torch.Tensor:
+        """u: (B, L, d_inner) -> (B, L, d_inner)"""
+        b, seq_len, e = u.shape
+        A = -torch.exp(self.A_log)
+        delta = F.softplus(self.dt_proj(u))
+        B_all = self.B_proj(u).view(b, seq_len, e, self.d_state)
+        C_all = self.C_proj(u).view(b, seq_len, e, self.d_state)
 
-    def retrieve(self, x: torch.Tensor) -> torch.Tensor:
-        """Inference-only read y = M*(q) with q = x W_Q (Titans Eq. 15)."""
-        q = self.proj_q(x)
-        return self.mlp(q)
+        h = torch.zeros(b, e, self.d_state, device=u.device, dtype=u.dtype)
+        outs: List[torch.Tensor] = []
+        for t in range(seq_len):
+            d = delta[:, t, :]
+            dA = torch.exp(d.unsqueeze(-1) * A.unsqueeze(0))
+            dB = d.unsqueeze(-1) * B_all[:, t]
+            h = dA * h + dB * u[:, t, :].unsqueeze(-1)
+            y = (h * C_all[:, t]).sum(dim=-1) + self.D_skip * u[:, t, :]
+            outs.append(y)
+        return torch.stack(outs, dim=1)
 
 
-class CausalAttentionBlock(nn.Module):
-    """Sliding-window-style causal attention + FFN as the Titans 'core' branch."""
+class MambaBlock(nn.Module):
+    """One Mamba-style block: in_proj -> SiLU -> causal depthwise conv -> SSM -> gated out."""
 
-    def __init__(self, d_model: int, nhead: int, dim_ff: int):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+    ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            d_model, nhead, batch_first=True, dropout=0.0
+        self.d_model = d_model
+        self.d_inner = int(expand * d_model)
+        self.d_conv = d_conv
+        self.norm = nn.LayerNorm(d_model)
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
+        self.conv1d = nn.Conv1d(
+            self.d_inner,
+            self.d_inner,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            bias=True,
+            padding=d_conv - 1,
         )
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_ff),
-            nn.GELU(),
-            nn.Linear(dim_ff, d_model),
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.ssm = SelectiveSSM(self.d_inner, d_state=d_state)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.size(1)
-        causal = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        attn_out, _ = self.self_attn(
-            x, x, x, attn_mask=causal, need_weights=False
-        )
-        x = self.norm1(x + attn_out)
-        x = self.norm2(x + self.ff(x))
-        return x
+        res = x
+        x = self.norm(x)
+        xz = self.in_proj(x)
+        x_inner, z = xz.chunk(2, dim=-1)
+        x_inner = F.silu(x_inner)
+        b, l, _ = x_inner.shape
+        xc = self.conv1d(x_inner.transpose(1, 2))[:, :, :l].transpose(1, 2)
+        x_inner = F.silu(xc)
+        y = self.ssm(x_inner)
+        y = y * F.silu(z)
+        return res + self.out_proj(y)
 
 
 class NeuralMemory(nn.Module):
-    def __init__(self, embed_dim: int = 128, hidden_dim: int = 256, max_seq_len: int = DEFAULT_MAX_SEQ_LEN):
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        hidden_dim: int = 256,
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    ):
         super().__init__()
+        _ = hidden_dim
 
         self.special_tokens = ["<BOS>", "<EOS>", "<UNK>"]
         self.ascii_tokens = [chr(i) for i in range(32, 127)]
@@ -133,31 +159,15 @@ class NeuralMemory(nn.Module):
         self.embedding = nn.Embedding(len(self.vocab), embed_dim)
         self.pos_embedding = nn.Embedding(max_seq_len, embed_dim)
 
-        self.long_term = NeuralLongTermMemory(embed_dim)
-        nhead = 8
-        dim_ff = hidden_dim * 2
-        self.core_blocks = nn.ModuleList(
+        d_state = max(8, min(32, embed_dim // 4))
+        self.mamba_blocks = nn.ModuleList(
             [
-                CausalAttentionBlock(embed_dim, nhead=nhead, dim_ff=dim_ff),
-                CausalAttentionBlock(embed_dim, nhead=nhead, dim_ff=dim_ff),
+                MambaBlock(embed_dim, d_state=d_state, d_conv=4, expand=2),
+                MambaBlock(embed_dim, d_state=d_state, d_conv=4, expand=2),
             ]
         )
         self.readout = nn.Linear(embed_dim, len(self.vocab))
-
-        # Outer loop: everything except the deep MLP weights (Titans: W_K, W_V, core, readout).
-        outer_params = (
-            list(self.embedding.parameters())
-            + list(self.pos_embedding.parameters())
-            + list(self.long_term.proj_k.parameters())
-            + list(self.long_term.proj_v.parameters())
-            + list(self.long_term.proj_q.parameters())
-            + list(self.core_blocks.parameters())
-            + list(self.readout.parameters())
-        )
-        self.optimizer = torch.optim.Adam(outer_params, lr=0.001)
-        self.memory_inner_optimizer = torch.optim.Adam(
-            self.long_term.mlp.parameters(), lr=0.01
-        )
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
 
         self.facts: List[str] = []
         self.training_text = ""
@@ -177,11 +187,11 @@ class NeuralMemory(nn.Module):
 
     def _forward_hidden(self, decoder_input: torch.Tensor) -> torch.Tensor:
         seq_len = decoder_input.size(1)
-        positions = torch.arange(seq_len, dtype=torch.long, device=decoder_input.device).unsqueeze(0)
-        emb = self.embedding(decoder_input) + self.pos_embedding(positions)
-        mem_read = self.long_term.retrieve(emb)
-        hidden = emb + mem_read
-        for block in self.core_blocks:
+        positions = torch.arange(
+            seq_len, dtype=torch.long, device=decoder_input.device
+        ).unsqueeze(0)
+        hidden = self.embedding(decoder_input) + self.pos_embedding(positions)
+        for block in self.mamba_blocks:
             hidden = block(hidden)
         return hidden
 
@@ -195,20 +205,6 @@ class NeuralMemory(nn.Module):
             merged_memory = self._compose_memory_text()
             target = self._text_to_ids(merged_memory)
         return merged_memory
-
-    def _inner_memory_updates(self, emb: torch.Tensor, steps: int) -> None:
-        """Test-time memorization on M only (simplified Titans inner loop)."""
-        emb_det = emb.detach()
-        with torch.no_grad():
-            k = self.long_term.proj_k(emb_det)
-            v = self.long_term.proj_v(emb_det)
-        for _ in range(steps):
-            self.memory_inner_optimizer.zero_grad(set_to_none=True)
-            pred = self.long_term.mlp(k)
-            loss = F.mse_loss(pred, v)
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.long_term.mlp.parameters(), max_norm=1.0)
-            self.memory_inner_optimizer.step()
 
     def update(self, fact: str, train_steps: int = DEFAULT_TRAIN_STEPS) -> str:
         clean_fact = fact.strip()
@@ -230,11 +226,6 @@ class NeuralMemory(nn.Module):
         self.training_text = merged_memory
         self.train()
 
-        positions = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-        emb0 = self.embedding(decoder_input) + self.pos_embedding(positions)
-        inner_steps = min(DEFAULT_INNER_MEMORY_STEPS, max(1, train_steps))
-        self._inner_memory_updates(emb0, inner_steps)
-
         loss = None
         for _ in range(train_steps):
             self.optimizer.zero_grad(set_to_none=True)
@@ -245,10 +236,14 @@ class NeuralMemory(nn.Module):
                 target.reshape(-1),
             )
             loss.backward()
-            nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]["params"], max_norm=1.0)
+            nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        return f"Memory Updated. Loss: {loss.item():.4f}" if loss is not None else "Memory update skipped."
+        return (
+            f"Memory Updated. Loss: {loss.item():.4f}"
+            if loss is not None
+            else "Memory update skipped."
+        )
 
     def recall(
         self,
@@ -286,69 +281,31 @@ class NeuralMemory(nn.Module):
 
 brain = NeuralMemory()
 brain_lock = threading.Lock()
-training_queue: "queue.Queue[str]" = queue.Queue()
 
 latest_training_status = "No training runs yet."
-latest_recalled_text = "No Titans memory encoded yet."
+latest_recalled_text = "No Mamba memory encoded yet."
 
 
 def write_to_neural_memory(fact: str) -> str:
-    training_queue.put(fact)
-    return "Titans training queued in background."
+    """Synchronously train Mamba memory on the new fact."""
+    global latest_training_status, latest_recalled_text
+
+    with brain_lock:
+        latest_training_status = brain.update(fact)
+        latest_recalled_text = brain.recall()
+    return latest_training_status
 
 
 def read_from_neural_memory(user_message: str = "") -> str:
+    """Decode current Mamba memory (no background queue required)."""
     global latest_recalled_text
 
-    if brain_lock.acquire(blocking=False):
-        try:
-            # latest_memory_text = (
-            #     brain._compose_memory_text() if brain.facts else brain.training_text
-            # )
-            latest_recalled_text = brain.recall(user_message=user_message)
-            print("Latest MEMORY:", latest_recalled_text)
-        finally:
-            brain_lock.release()
+    with brain_lock:
+        latest_recalled_text = brain.recall(user_message=user_message)
+        print("Latest MEMORY:", latest_recalled_text)
 
-    # memory_text = latest_recalled_text[-MAX_MEMORY_CHARS:]
-    recalled_text = latest_recalled_text[-MAX_MEMORY_CHARS:]
-    return (
-        f"Titans Memory Text: {recalled_text or '[]'}\n"
-    )
-
-
-def _training_worker() -> None:
-    global latest_training_status, latest_recalled_text
-
-    log = _get_training_logger()
-    log.info("Training worker started.")
-
-    while True:
-        fact = training_queue.get()
-        log.info("Dequeued training item: %r", fact)
-        if fact is None:
-            log.info("Received shutdown sentinel; exiting training worker loop.")
-            training_queue.task_done()
-            break
-
-        try:
-            log.info("Starting neural memory update for fact.")
-            with brain_lock:
-                latest_training_status = brain.update(fact)
-            log.info("Training update finished: %s", latest_training_status)
-        except Exception as err:
-            latest_training_status = f"Background training failed: {err}"
-            log.exception("Background training failed: %s", err)
-        finally:
-            training_queue.task_done()
-            log.info("Marked training queue item as done.")
-
-
-def _start_training_worker() -> None:
-    thread = threading.Thread(
-        target=_training_worker, daemon=True, name="memory-trainer"
-    )
-    thread.start()
+    memory_text = latest_recalled_text[-MAX_MEMORY_CHARS:]
+    return f"Mamba Memory Text: {memory_text if memory_text else '[empty]'}\n"
 
 
 response_agent = Agent(
@@ -356,7 +313,7 @@ response_agent = Agent(
     description="Fast memory-grounded assistant.",
     instructions=[
         "Answer in 1-3 concise sentences.",
-        "Use only the provided Titans memory snapshot for profile facts.",
+        "Use only the provided Mamba memory snapshot for profile facts.",
         "If the snapshot has no fact, say you do not have that information yet.",
     ],
     markdown=True,
@@ -431,7 +388,6 @@ def save_neural_memory_checkpoint(path: str = DEFAULT_CHECKPOINT_PATH) -> str:
     checkpoint = {
         "model_state": brain.state_dict(),
         "optimizer_state": brain.optimizer.state_dict(),
-        "memory_inner_optimizer_state": brain.memory_inner_optimizer.state_dict(),
         "facts": list(brain.facts),
         "training_text": brain.training_text,
         "max_seq_len": brain.max_seq_len,
@@ -451,16 +407,9 @@ def load_neural_memory_checkpoint(path: str = DEFAULT_CHECKPOINT_PATH) -> str:
     if optimizer_state:
         brain.optimizer.load_state_dict(optimizer_state)
 
-    mem_inner = checkpoint.get("memory_inner_optimizer_state")
-    if mem_inner:
-        brain.memory_inner_optimizer.load_state_dict(mem_inner)
-
     brain.facts = list(checkpoint.get("facts", []))
     brain.training_text = checkpoint.get("training_text", "")
-    # latest_memory_text = (
-    #     brain._compose_memory_text() if brain.facts else brain.training_text
-    # )
-    # latest_recalled_text = brain.recall()
+    latest_recalled_text = brain.recall()
     return path
 
 
@@ -476,7 +425,6 @@ def run_chat() -> None:
         if not user_message:
             continue
         if user_message.lower() in {"exit", "quit"}:
-            training_queue.join()
             with brain_lock:
                 checkpoint_path = save_neural_memory_checkpoint()
             print(f"Saved neural memory checkpoint to {checkpoint_path}.")
@@ -487,7 +435,6 @@ def run_chat() -> None:
 
 
 if __name__ == "__main__":
-    _start_training_worker()
     if os.path.exists(DEFAULT_CHECKPOINT_PATH):
         with brain_lock:
             checkpoint_path = load_neural_memory_checkpoint()
