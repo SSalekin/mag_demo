@@ -2,3 +2,4 @@ torch
 agno
 ollama
 transformers
+tiktoken

@@ -26,6 +26,7 @@ DEFAULT_TRAIN_STEPS = 50
 DEFAULT_INNER_MEMORY_STEPS = 50
 DEFAULT_MAX_SEQ_LEN = 1024
 DEFAULT_CHECKPOINT_PATH = "neural_memory.pt"
+CHAT_CONSOLIDATION_INTERVAL = 5
 TRAINING_LOG_PATH = "training_worker.log"
 
 _training_logger: Optional[logging.Logger] = None
@@ -210,6 +211,21 @@ class NeuralMemory(nn.Module):
             nn.utils.clip_grad_norm_(self.long_term.mlp.parameters(), max_norm=1.0)
             self.memory_inner_optimizer.step()
 
+    def consolidate(self, train_steps: int = DEFAULT_TRAIN_STEPS) -> str:
+        if not self.facts:
+            return "Memory consolidation skipped: no facts to consolidate."
+
+        merged_memory = self._compose_memory_text()
+        prefix = "Consolidated memory: "
+        max_summary_chars = max(1, self.max_seq_len - len(prefix) - 1)
+        summary_body = merged_memory[:max_summary_chars].rstrip()
+        if len(merged_memory) > max_summary_chars:
+            summary_body = summary_body[: max(1, max_summary_chars - 3)].rstrip() + "..."
+
+        summary_fact = f"{prefix}{summary_body}"
+        self.facts = [summary_fact]
+        return self.update(summary_fact, train_steps=train_steps)
+
     def update(self, fact: str, train_steps: int = DEFAULT_TRAIN_STEPS) -> str:
         clean_fact = fact.strip()
         if not clean_fact:
@@ -287,6 +303,7 @@ class NeuralMemory(nn.Module):
 brain = NeuralMemory()
 brain_lock = threading.Lock()
 training_queue: "queue.Queue[str]" = queue.Queue()
+chat_turn_count = 0
 
 latest_training_status = "No training runs yet."
 latest_recalled_text = "No Titans memory encoded yet."
@@ -390,12 +407,7 @@ def _should_memorize(user_message: str) -> bool:
 
 def _queue_memorize_if_needed(user_message: str) -> None:
     if _should_memorize(user_message):
-        threading.Thread(
-            target=write_to_neural_memory,
-            args=(user_message,),
-            daemon=True,
-            name="memorize-dispatch",
-        ).start()
+        write_to_neural_memory(user_message)
 
 
 def _answer_with_memory_context(user_message: str) -> None:
@@ -408,6 +420,17 @@ def _answer_with_memory_context(user_message: str) -> None:
     )
     response_agent.print_response(grounded_prompt)
     _queue_memorize_if_needed(user_message)
+
+
+def _consolidate_memory_after_interval() -> str:
+    global latest_training_status, latest_recalled_text
+
+    training_queue.join()
+    with brain_lock:
+        status = brain.consolidate()
+        latest_training_status = status
+        latest_recalled_text = brain.recall()
+    return status
 
 
 def run_seed_demo() -> None:
@@ -465,6 +488,8 @@ def load_neural_memory_checkpoint(path: str = DEFAULT_CHECKPOINT_PATH) -> str:
 
 
 def run_chat() -> None:
+    global chat_turn_count
+
     print("Neural memory chat started. Type 'exit' or 'quit' to stop.")
     while True:
         try:
@@ -484,6 +509,10 @@ def run_chat() -> None:
             break
 
         _answer_with_memory_context(user_message)
+        chat_turn_count += 1
+        if chat_turn_count % CHAT_CONSOLIDATION_INTERVAL == 0:
+            consolidation_status = _consolidate_memory_after_interval()
+            print(consolidation_status)
 
 
 if __name__ == "__main__":
