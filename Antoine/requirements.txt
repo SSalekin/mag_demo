@@ -1,0 +1,8 @@
+ollama
+rich
+tiktoken
+numpy
+matplotlib
+seaborn
+pandas
+tabulate
