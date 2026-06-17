@@ -67,3 +67,12 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.pt
+
+
+# Local memory files
+**/mamba_memory_store.pt
+**/benchmark_memory_store.pt
+
+# Python cache
+__pycache__/
+*.pyc
