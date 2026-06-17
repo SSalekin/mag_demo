@@ -3,6 +3,7 @@ import os
 from models.transformer_model import TransformerModel
 from models.lstm_model import LstmModel
 from models.gru_model import GruModel
+from models.gnn_model import GnnModel
 from ui.terminal import TUI
 
 def main():
@@ -15,11 +16,12 @@ def main():
     print("1. Transformer (KV-Cache)")
     print("2. LSTM (Hidden State)")
     print("3. GRU (Hidden State)")
+    print("4. GNN (Graph Neural Network)")
     while True:
-        choice = input("Select an architecture (1, 2 or 3): ").strip()
-        if choice in ['1', '2', '3']:
+        choice = input("Select an architecture (1, 2, 3 or 4): ").strip()
+        if choice in ['1', '2', '3', '4']:
             break
-        print("Invalid choice. Please enter 1, 2 or 3.")
+        print("Invalid choice. Please enter 1, 2, 3 or 4.")
         
     if choice == '1':
         model_class = TransformerModel
@@ -29,10 +31,14 @@ def main():
         model_class = LstmModel
         memory_file = "memory_lstm.pt"
         arch_name = "LSTM"
-    else:
+    elif choice == '3':
         model_class = GruModel
         memory_file = "memory_gru.pt"
         arch_name = "GRU"
+    else:
+        model_class = GnnModel
+        memory_file = "memory_gnn.pt"
+        arch_name = "GNN"
         
     # Initialization
     model = model_class(model_name=MODEL_NAME, max_capacity=MAX_KV_CAPACITY)

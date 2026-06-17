@@ -21,6 +21,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.transformer_model import TransformerModel
 from models.lstm_model import LstmModel
 from models.gru_model import GruModel
+from models.gnn_model import GnnModel
 
 TestCase = Dict[str, object]
 
@@ -208,7 +209,7 @@ def run_test(test: TestCase, model_class, args: argparse.Namespace) -> Dict[str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark Antoine memory architectures.")
-    parser.add_argument("--arch", choices=["transformer", "lstm", "gru"], default=None, help="Which memory architecture to test")
+    parser.add_argument("--arch", choices=["transformer", "lstm", "gru", "gnn"], default=None, help="Which memory architecture to test")
     parser.add_argument("--ollama-model", default="llama3", help="The Ollama model to use for inference")
     parser.add_argument("--capacity", type=int, default=8192, help="The maximum memory capacity")
     parser.add_argument("--debug", action="store_true", help="Print debug info")
@@ -219,8 +220,9 @@ def main() -> int:
         print("1. Transformer (KV-Cache)")
         print("2. LSTM (Hidden State)")
         print("3. GRU (Hidden State)")
+        print("4. GNN (Graph Neural Network)")
         while True:
-            choice = input("Select an architecture to benchmark (1, 2 or 3): ").strip()
+            choice = input("Select an architecture to benchmark (1, 2, 3 or 4): ").strip()
             if choice == '1':
                 args.arch = "transformer"
                 break
@@ -230,12 +232,16 @@ def main() -> int:
             elif choice == '3':
                 args.arch = "gru"
                 break
-            print("Invalid choice. Please enter 1, 2 or 3.")
+            elif choice == '4':
+                args.arch = "gnn"
+                break
+            print("Invalid choice. Please enter 1, 2, 3 or 4.")
 
     arch_map = {
         "transformer": TransformerModel,
         "lstm": LstmModel,
-        "gru": GruModel
+        "gru": GruModel,
+        "gnn": GnnModel
     }
     model_class = arch_map[args.arch]
 
