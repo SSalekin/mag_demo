@@ -143,3 +143,10 @@ elwen/
 ```
 
 Each model should have its own implementation, benchmark, and README so that results can be compared cleanly.
+
+
+## v8 fixes
+
+- Fixed full-name possessive updates such as `Sarah Nguyen's favorite color is now black`.
+- Added subject-aware entity matching.
+- Added stricter filtering for single-value properties such as secret codes, favorite colors, languages, and office rooms.

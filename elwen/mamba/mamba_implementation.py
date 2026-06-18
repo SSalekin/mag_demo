@@ -322,6 +322,21 @@ def entity_match_score(query: str, memory_text: str) -> float:
     return len(q_entities & m_entities) / len(q_entities)
 
 
+def subject_entity_match_score(q_entities: set[str], subject: Optional[str]) -> float:
+    """
+    Compare the query entities with the stored canonical subject.
+
+    This avoids retrieving "MarcoAlpha Wilson's secret code" for a question about
+    "CarlosBeta Wilson's secret code" just because they share the last name Wilson.
+    """
+    if not q_entities or not subject:
+        return 0.0
+    subject_tokens = set(subject.split())
+    if not subject_tokens:
+        return 0.0
+    return len(q_entities & subject_tokens) / len(q_entities)
+
+
 def property_key(text: str) -> Optional[str]:
     lower = text.lower()
     for key, pattern in PROPERTY_PATTERNS:
@@ -344,10 +359,14 @@ def is_broad_memory_question(question: str) -> bool:
 
 def extract_subject(text: str) -> Optional[str]:
     """
-    Extract a simple subject key:
-    - "Lucas's secret code..." -> lucas
-    - "Hugo Bernard is..." -> hugo bernard
-    - "My favorite color..." -> user
+    Extract a canonical subject key.
+
+    Fixed in this version:
+    - "Sarah Nguyen's favorite color..." -> "sarah nguyen"
+    - "PriyaAlpha Meyer's secret code..." -> "priyaalpha meyer"
+
+    The previous implementation only handled one-word possessives, so updates
+    with full names did not deactivate the old fact.
     """
     stripped = normalize_statement_for_storage(text)
     lower = stripped.lower()
@@ -355,9 +374,13 @@ def extract_subject(text: str) -> Optional[str]:
     if lower.startswith(("my ", "i ", "i'm", "i am")):
         return "user"
 
-    possessive = re.match(r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+)'s\b", stripped)
+    # Multi-word possessive: "Sarah Nguyen's ...", "PriyaAlpha Meyer's ..."
+    possessive = re.match(
+        r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})'s\b",
+        stripped,
+    )
     if possessive:
-        return possessive.group(1).lower()
+        return " ".join(words(possessive.group(1)))
 
     named = re.match(
         r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})\s+"
@@ -824,7 +847,10 @@ class MambaVectorMemory:
         for idx, item in enumerate(active_items):
             semantic = float(semantic_scores[idx].item())
             lexical = lexical_overlap(query, item.text)
-            entity = entity_match_score(query, item.text)
+            entity = max(
+                entity_match_score(query, item.text),
+                subject_entity_match_score(q_entities, item.subject),
+            )
             prop = 1.0 if q_property and item.property == q_property else property_match_score(query, item.text)
 
             # Small recency bonus: useful for updated facts, but not enough to override relevance.
@@ -857,6 +883,13 @@ class MambaVectorMemory:
 
             # Keep useful candidates. If an entity is specified, require entity match OR very high lexical/property match.
             if q_entities and entity == 0.0 and lexical < 0.34 and prop == 0.0:
+                continue
+
+            # For precise single-value questions such as secret code, favorite color,
+            # office room, etc., a partial entity match is dangerous.
+            # Example: "CarlosBeta Wilson's secret code" must not retrieve
+            # "MarcoAlpha Wilson's secret code" just because both share "Wilson".
+            if q_entities and q_property in SINGLE_VALUE_PROPERTIES and prop > 0 and entity < 1.0:
                 continue
 
             if hybrid >= min_score:

@@ -69,10 +69,17 @@ Thumbs.db
 *.pt
 
 
-# Local memory files
+# Local memory and comparison outputs
 **/mamba_memory_store.pt
 **/benchmark_memory_store.pt
-
-# Python cache
+**/titan_memory_store.pt
+**/benchmark_titan_memory_store.pt
+**/comparison/results/
+**/*_comparison_memory_store.pt
+**/*_comparison_v2_memory_store.pt
+**/*_stress_memory_store.pt
+**/stress_comparison_*.csv
+**/stress_comparison_report_*.md
 __pycache__/
 *.pyc
+
