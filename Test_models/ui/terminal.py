@@ -28,7 +28,7 @@ class TUI:
         """Stores a message in the UI's local chat history."""
         self.chat_history.append((role, message, tracked))
         
-    def render(self, active_tokens: int, max_capacity: int, dropped_tokens: int = 0, arch_name: str = "Transformer KV-Cache"):
+    def render(self, active_tokens: int, max_capacity: int, dropped_tokens: int = 0, arch_name: str = "Transformer KV-Cache", model_name: str = "llama3"):
         """
         Clears the screen and renders the Dashboard and Chat panels.
         """
@@ -37,7 +37,7 @@ class TUI:
         # 1. Create Dashboard Panel
         percentage = (active_tokens / max_capacity) * 100
         dashboard_text = Text()
-        dashboard_text.append(f"Model: Ollama (llama3) | Memory: Simulated {arch_name}\n", style="bold cyan")
+        dashboard_text.append(f"Model: Ollama ({model_name}) | Memory: Simulated {arch_name}\n", style="bold cyan")
         dashboard_text.append(f"Active Tokens in KV-Cache: ", style="yellow")
         
         # Color code the token count based on usage

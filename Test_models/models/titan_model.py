@@ -14,7 +14,7 @@ This is not the full Google Titans architecture trained end-to-end.
 
 from __future__ import annotations
 
-import argparse, hashlib, os, re, shutil, time
+import argparse, hashlib, re, shutil, time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -24,9 +24,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .titan_config import TitanMemoryConfig
-except Exception:  # pragma: no cover - allows running titan_model.py directly
-    from titan_config import TitanMemoryConfig  # type: ignore
+    from .titans_ltm import MemoryState, NeuralLongTermMemory, TitansMemoryConfig
+except ImportError:  # Allows running this file directly from Test_models/models.
+    from titans_ltm import MemoryState, NeuralLongTermMemory, TitansMemoryConfig
 
 
 USE_COLOR = True
@@ -88,7 +88,7 @@ STOPWORDS = {
     "please","can","could","would","should","now","currently","actually","learn","remember","that"
 }
 QUESTION_STARTERS = ("what","where","when","who","why","how","which","do","does","did","can","could","would","should","is","are","am","tell me","explain","give me","show me")
-MEMORY_MARKERS = ("my name is","i am","i'm","i live","i study","i work","i like","i love","my favorite","my favourite","i prefer","i want","i need","i was born","remember that","note that","save this","learn that","lives in","likes","favorite color","favourite color","favorite programming language","programming language","secret code","temporary access code","student id","office room","portfolio password","research group","operating system","was born","is from","works on","studies","speaks","prefers","is currently","wants to")
+MEMORY_MARKERS = ("my name is","i am","i'm","i live","i study","i work","i like","i love","my favorite","my favourite","i prefer","i want","i need","i was born","remember that","note that","save this","learn that","lives in","likes","favorite color","favourite color","favorite programming language","programming language","secret code","temporary access code","student id","office room","portfolio password","research group","operating system","was born","is from","works on","studies","is currently","wants to")
 UPDATE_MARKERS = ("actually","now","changed","instead","no longer","correction","update:","is now","currently")
 FORGET_MARKERS = ("forget","delete","remove","do not remember","don't remember","erase")
 BROAD_MEMORY_PATTERNS = ("what do you know about me","what do you remember about me","summarize my profile","summarise my profile","who am i")
@@ -101,8 +101,8 @@ PROPERTY_PATTERNS: List[Tuple[str,str]] = [
     ("research_group", r"\bresearch group\b|\blab\b|\blaboratory\b"),
     ("favorite_color", r"\bfavo[u]?rite color\b|\bcolor\b|\bcolour\b"),
     ("favorite_food", r"\bfavo[u]?rite food\b|\bfood\b"),
-    ("favorite_language", r"\bfavo[u]?rite programming language\b|\bprogramming language\b|\bfavo[u]?rite language\b|\bprefer(?:red|s)? language\b"),
-    ("spoken_languages", r"\blanguages?\b|\bspeaks?\b|\bfrançais\b|\bfrench\b|\benglish\b|\bspanish\b"),
+    ("favorite_language", r"\bfavo[u]?rite programming language\b|\bprogramming language\b|\bfavo[u]?rite language\b"),
+    ("languages", r"\bspeaks?\b|\bwhich languages?\b|\bspoken languages?\b|\blanguages spoken\b"),
     ("favorite_os", r"\bfavo[u]?rite operating system\b|\boperating system\b|\bos\b"),
     ("favorite_opening", r"\bfavo[u]?rite chess opening\b|\bchess opening\b"),
     ("study", r"\bstud(?:y|ies|ying)\b|\bstudent\b|\bschool\b|\buniversity\b"),
@@ -164,9 +164,28 @@ def property_key(text: str) -> Optional[str]:
     return None
 
 
+def properties_compatible(query_prop: Optional[str], item_prop: Optional[str]) -> bool:
+    if not query_prop or not item_prop:
+        return False
+    if query_prop == item_prop:
+        return True
+    compatible_groups = [
+        {"location", "current_location"},
+    ]
+    return any(query_prop in group and item_prop in group for group in compatible_groups)
+
+
 def property_match_score(query: str, memory_text: str) -> float:
     q=property_key(query)
-    return 0.0 if not q else (1.0 if property_key(memory_text)==q else 0.0)
+    m=property_key(memory_text)
+    return 0.0 if not q else (1.0 if properties_compatible(q, m) else 0.0)
+
+
+def subject_exact_match(q_entities: set[str], subject: Optional[str]) -> bool:
+    if not q_entities or not subject:
+        return False
+    subject_tokens=set(subject.split())
+    return bool(subject_tokens) and subject_tokens.issubset(q_entities)
 
 
 def is_broad_memory_question(question: str) -> bool:
@@ -175,11 +194,13 @@ def is_broad_memory_question(question: str) -> bool:
 
 def normalize_statement_for_storage(text: str) -> str:
     s=clean_text(text)
-    # Benchmarks and the terminal adapter often wrap facts with natural-language
-    # instructions. Strip those instructions so subject/property extraction sees
-    # the real fact, not the phrase "Please remember...".
-    s=re.sub(r"(?i)^please\s+remember\s+(?:this\s+)?(?:information)?\s*:?\s*", "", s).strip()
-    s=re.sub(r"(?i)^remember\s+(?:this\s+)?(?:information)?\s*:?\s*", "", s).strip()
+    # Benchmark and chat adapters often use wrappers such as
+    # "Please remember this information: <fact>". These wrappers must not be
+    # stored as part of the fact, otherwise subject/property extraction fails and
+    # old values are not deactivated correctly.
+    s=re.sub(r"(?i)^please\s+remember\s+this\s+information\s*:\s*", "", s).strip()
+    s=re.sub(r"(?i)^please\s+remember\s*:\s*", "", s).strip()
+    s=re.sub(r"(?i)^remember\s+this\s+information\s*:\s*", "", s).strip()
     s=re.sub(r"(?i)^(learn|remember|note)\s+that\s+", "", s).strip()
     s=re.sub(r"(?i)^save\s+this\s*:\s*", "", s).strip()
     s=re.sub(r"(?i)^(actually|correction|update)\s*[:,]?\s*", "", s).strip()
@@ -192,33 +213,8 @@ def extract_subject(text: str) -> Optional[str]:
     # Multi-word possessive: "Sarah Nguyen's ...", "PriyaAlpha Meyer's ..."
     m=re.match(r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})'s\b", s)
     if m: return " ".join(words(m.group(1)))
-    m=re.match(r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})\s+(?:is|lives|likes|works|studies|has|wants|enjoys|speaks|prefers)\b", s)
+    m=re.match(r"^([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})\s+(?:is|lives|likes|works|studies|has|wants|enjoys|speaks)\b", s)
     return " ".join(words(m.group(1))) if m else None
-
-
-def extract_query_subject(text: str) -> Optional[str]:
-    """Extract the entity a question is about, with preference for full names.
-
-    This is intentionally conservative. It improves identity-collision cases such
-    as Sarah Nguyen vs Sarah Martin by giving retrieval a canonical target.
-    """
-    s=clean_text(text)
-    # Possessive query: "What is Sarah Nguyen's favorite color?"
-    m=re.search(r"\b([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})'s\b", s)
-    if m: return " ".join(words(m.group(1)))
-    # Common QA patterns.
-    patterns=[
-        r"\b(?:about|for|of)\s+([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})\b",
-        r"\b(?:is|does|did|do)\s+([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2})\b",
-        r"\b(?:Where|What|Which|Who)\s+.*?\b([A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+)\b",
-    ]
-    for pat in patterns:
-        m=re.search(pat, s)
-        if m:
-            candidate=" ".join(words(m.group(1)))
-            if candidate and candidate not in STOPWORDS:
-                return candidate
-    return None
 
 
 def has_update_marker(text: str) -> bool: return any(m in text.lower() for m in UPDATE_MARKERS)
@@ -228,7 +224,7 @@ def looks_like_memory_statement(text: str) -> bool:
     s=clean_text(text); low=s.lower()
     if not s or s.endswith("?"): return False
     if any(m in low for m in MEMORY_MARKERS): return True
-    if re.match(r"^[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2}\s+(?:is|lives|likes|works|studies|has|wants|enjoys|speaks|prefers)\b", s): return True
+    if re.match(r"^[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+(?:\s+[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+){0,2}\s+(?:is|lives|likes|works|studies|has|wants|enjoys|speaks)\b", s): return True
     if re.match(r"^[A-Z][a-zA-ZÀ-ÖØ-öø-ÿ']+'s\s+.+\s+(?:is|are|was|were)\b", s): return True
     return False
 
@@ -323,7 +319,6 @@ class TitanMemoryNetwork(nn.Module):
     def query(self, x: torch.Tensor) -> torch.Tensor: return l2_normalize(self.proj_q(x))
     def retrieve_value(self, q: torch.Tensor) -> torch.Tensor: return l2_normalize(self.memory_mlp(q))
     def associative_loss(self, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor: return F.mse_loss(self.memory_mlp(k), v)
-    def parameter_count(self) -> int: return sum(p.numel() for p in self.parameters())
 
 
 @dataclass
@@ -360,28 +355,33 @@ class MemoryItem:
 class TitanExternalMemory:
     def __init__(self, memory_path: Optional[Path]=None, d_model: int=128, hidden_dim: int=256,
                  max_items: int=5000, device: str="cpu", learning_rate: float=0.01,
-                 weight_decay: float=0.001, replay_items: int=8,
-                 config: Optional[TitanMemoryConfig]=None) -> None:
-        # Backward-compatible constructor: old code can still pass d_model,
-        # hidden_dim, max_items, etc.; new code can pass TitanMemoryConfig.
-        if config is None:
-            config=TitanMemoryConfig(
-                d_model=d_model, hidden_dim=hidden_dim, max_items=max_items,
-                device=device, learning_rate=learning_rate,
-                weight_decay=weight_decay, replay_items=replay_items,
-            )
-        resolved_device=config.resolved_device(torch.cuda.is_available())
-        self.config=config
-        self.memory_path=memory_path; self.d_model=config.d_model; self.hidden_dim=config.hidden_dim
-        self.max_items=config.max_items; self.device=resolved_device; self.learning_rate=config.learning_rate
-        self.weight_decay=config.weight_decay; self.replay_items=config.replay_items
-        self.surprise_momentum=config.surprise_momentum; self.surprise_lr_scale=config.surprise_lr_scale
-        self.min_train_steps=config.min_train_steps; self.max_train_steps=config.max_train_steps
-        self.forgetting_decay=config.forgetting_decay
-        self._surprise_state=0.0
-        info(f"Loading Titan neural memory on {resolved_device}.")
-        self.network=TitanMemoryNetwork(self.d_model, self.hidden_dim).to(resolved_device)
-        self.optimizer=torch.optim.AdamW(self.network.memory_mlp.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+                 weight_decay: float=0.001, replay_items: int=8, use_aedelon_ltm: bool=True,
+                 ltm_momentum: float=0.90) -> None:
+        self.memory_path=memory_path; self.d_model=d_model; self.hidden_dim=hidden_dim
+        self.max_items=max_items; self.device=device; self.learning_rate=learning_rate
+        self.weight_decay=weight_decay; self.replay_items=replay_items
+        self.use_aedelon_ltm=use_aedelon_ltm; self.ltm_momentum=ltm_momentum
+        info(f"Loading Titan neural memory on {device}.")
+
+        # Legacy MLP network is kept for backwards compatibility with older saved
+        # memories and as a fallback if the standalone Titans LTM is disabled.
+        self.network=TitanMemoryNetwork(d_model, hidden_dim).to(device)
+        self.optimizer=torch.optim.AdamW(self.network.memory_mlp.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Aedelon/Titans-inspired long-term neural memory. This is the part that
+        # matches Tony's instruction: use the memory only, not a full Titans LLM.
+        self.ltm_config=TitansMemoryConfig(
+            dim=d_model,
+            num_memory_layers=2,
+            memory_hidden_mult=max(1.0, hidden_dim / max(1, d_model)),
+            memory_lr=min(max(float(learning_rate), 1e-4), 1.0),
+            memory_momentum=ltm_momentum,
+            memory_decay=min(max(float(weight_decay), 0.0), 0.99),
+            activation="gelu",
+        )
+        self.ltm=NeuralLongTermMemory(self.ltm_config).to(device)
+        self.ltm_state=self.ltm.init_state(device)
+
         self._items: List[MemoryItem]=[]; self._next_id=1
         if self.memory_path and self.memory_path.exists():
             try: self.load(self.memory_path); memory_print(f"Loaded {len(self.active_items)} active memory item(s).")
@@ -403,31 +403,32 @@ class TitanExternalMemory:
 
     def _surprise(self, key: torch.Tensor, value: torch.Tensor) -> float:
         with torch.no_grad():
+            if self.use_aedelon_ltm:
+                pred=self.ltm.retrieve(key.to(self.device).view(1,1,-1), self.ltm_state).view(-1).detach().cpu()
+                return float(F.mse_loss(pred, value.cpu()).item())
             pred=self.network.retrieve_value(key.to(self.device).unsqueeze(0))
             return float(F.mse_loss(pred, value.to(self.device).unsqueeze(0)).item())
 
-    def _train_association(self, key: torch.Tensor, value: torch.Tensor, surprise: float, base_steps: Optional[int]=None) -> None:
-        # Titans-inspired surprise: the current loss controls how much the
-        # test-time neural memory should adapt. Momentum keeps nearby facts
-        # memorable instead of only reacting to a single surprising statement.
-        self._surprise_state=self.surprise_momentum*self._surprise_state + (1.0-self.surprise_momentum)*float(surprise)
-        signal=float(surprise) + self._surprise_state
-        min_steps=max(1, int(self.min_train_steps if base_steps is None else base_steps))
-        steps=min(self.max_train_steps, min_steps + int(signal*self.surprise_lr_scale*100))
+    def _train_association(self, key: torch.Tensor, value: torch.Tensor, surprise: float, base_steps: int=12) -> None:
+        steps=base_steps + min(28, int(surprise*400))
 
-        # Small rehearsal buffer to reduce catastrophic overwriting of recent
-        # associations. This is the lightweight equivalent of keeping a short
-        # active memory next to the long-term MLP.
+        if self.use_aedelon_ltm:
+            # Update the standalone Titans LTM state at test time. Unlike the
+            # older Adam-trained MLP, Titans is an online memory: a few surprise
+            # updates are enough and keep storage fast on a normal PC.
+            replay=[key] + [i.key for i in sorted(self.active_items, key=lambda i: i.updated_at, reverse=True)[:self.replay_items]]
+            x=torch.stack([k.to(self.device) for k in replay], dim=0).view(1, len(replay), self.d_model)
+            ltm_steps = 1 + min(4, int(max(0.0, surprise) * 100))
+            for _ in range(max(1, ltm_steps)):
+                _, self.ltm_state = self.ltm(x, self.ltm_state, update=True)
+            return
+
         pairs=[(key,value)] + [(i.key,i.value) for i in sorted(self.active_items, key=lambda i: i.updated_at, reverse=True)[:self.replay_items]]
-        batch_k=torch.stack([p[0] for p in pairs]).to(self.device)
-        batch_v=torch.stack([p[1] for p in pairs]).to(self.device)
-        for group in self.optimizer.param_groups:
-            group["weight_decay"] = self.weight_decay + self.forgetting_decay * min(1.0, signal)
         self.network.train()
         for _ in range(max(1, steps)):
             self.optimizer.zero_grad(set_to_none=True)
-            loss=self.network.associative_loss(batch_k, batch_v)
-            loss.backward()
+            losses=[self.network.associative_loss(k.to(self.device).unsqueeze(0), v.to(self.device).unsqueeze(0)) for k,v in pairs]
+            loss=torch.stack(losses).mean(); loss.backward()
             nn.utils.clip_grad_norm_(self.network.memory_mlp.parameters(), max_norm=1.0)
             self.optimizer.step()
 
@@ -470,46 +471,44 @@ class TitanExternalMemory:
         active=self.active_items
         if not active: return []
         if is_broad_memory_question(query):
-            return [(1.0, {"neural":1.0,"key":0.0,"lexical":0.0,"entity":0.0,"subject":0.0,"property":0.0,"recency":0.0}, i) for i in sorted(active, key=lambda i: i.updated_at, reverse=True)[:max(k,8)]]
-
+            return [(1.0, {"neural":1.0,"key":0.0,"lexical":0.0,"entity":0.0,"property":0.0,"recency":0.0}, i) for i in sorted(active, key=lambda i: i.updated_at, reverse=True)[:max(k,8)]]
         qkey,_=self._make_key_value(query); qents=extract_entities(query); qprop=property_key(query)
-        qsubject=self._resolve_subject(extract_query_subject(query))
-        qsubject_tokens=set(qsubject.split()) if qsubject else set()
-        exact_subject_exists=bool(qsubject and any(i.subject==qsubject for i in active))
-
         with torch.no_grad():
-            nread=self.network.retrieve_value(qkey.to(self.device).unsqueeze(0))[0].detach().cpu()
+            if self.use_aedelon_ltm:
+                nread=self.ltm.retrieve(qkey.to(self.device).view(1,1,-1), self.ltm_state).view(-1).detach().cpu()
+            else:
+                nread=self.network.retrieve_value(qkey.to(self.device).unsqueeze(0))[0].detach().cpu()
         scored=[]; t=now()
         for item in active:
             key_score=float(torch.dot(l2_normalize(qkey), l2_normalize(item.key)).item())
             neural=float(torch.dot(l2_normalize(nread), l2_normalize(item.value)).item())
             lex=lexical_overlap(query, item.text)
             ent=max(entity_match_score(query, item.text), subject_entity_match_score(qents, item.subject))
-            subj=0.0
-            if qsubject and item.subject:
-                subj=1.0 if item.subject==qsubject else len(qsubject_tokens & set(item.subject.split())) / max(1, len(qsubject_tokens))
-                ent=max(ent, subj)
-            prop=1.0 if qprop and item.property==qprop else property_match_score(query, item.text)
+            prop=1.0 if qprop and properties_compatible(qprop, item.property) else property_match_score(query, item.text)
             rec=1.0/(1.0+max(0.0,(t-item.updated_at)/3600.0))
-
-            # Safer subject/property filtering. When a precise full-name subject
-            # exists in memory, do not let another Sarah/Martin/etc. win only
-            # through lexical overlap or neural similarity.
-            if exact_subject_exists and qprop and item.subject!=qsubject:
-                continue
-            if qents and qprop in SINGLE_VALUE_PROPERTIES and prop>0 and ent<1.0:
-                continue
-            if qents and ent==0.0 and lex<0.34 and prop==0.0:
-                continue
-
             ent_pen=-0.25 if qents and ent==0.0 else 0.0
-            subject_bonus=0.28 if qsubject and item.subject==qsubject else 0.0
-            subject_penalty=-0.18 if qsubject and item.subject and item.subject!=qsubject else 0.0
-            prop_bonus=0.14 if qprop and prop>0 else 0.0
-            hybrid=(0.20*neural + 0.18*key_score + 0.23*lex + 0.18*ent +
-                    0.08*prop + 0.03*rec + subject_bonus + subject_penalty + ent_pen + prop_bonus)
-            details={"neural":neural,"key":key_score,"lexical":lex,"entity":ent,"subject":subj,"property":prop,"recency":rec}
+            prop_bonus=0.12 if qprop and prop>0 else 0.0
+            hybrid=0.24*neural + 0.20*key_score + 0.25*lex + 0.22*ent + 0.09*prop + 0.03*rec + ent_pen + prop_bonus
+            details={"neural":neural,"key":key_score,"lexical":lex,"entity":ent,"property":prop,"recency":rec}
+            if qents and ent==0.0 and lex<0.34 and prop==0.0: continue
+            # For precise single-value properties, partial identity matches are unsafe.
+            # Example: do not retrieve another person's secret code just because they
+            # share the same last name.
+            if qents and qprop in SINGLE_VALUE_PROPERTIES and prop>0 and ent<1.0: continue
             if hybrid>=min_score: scored.append((hybrid, details, item))
+
+        # If the query names a precise subject and property, prefer exact
+        # subject/property matches before neural/lexical scores. This fixes cases
+        # where a profile sentence about the same person outranks the exact fact
+        # being requested, e.g. asking for Sarah Nguyen's color returns her age.
+        if qents and qprop:
+            exact_subject_property = [
+                row for row in scored
+                if subject_exact_match(qents, row[2].subject) and properties_compatible(qprop, row[2].property)
+            ]
+            if exact_subject_property:
+                scored = exact_subject_property
+
         scored.sort(key=lambda row: row[0], reverse=True); results=scored[:max(1,min(k,len(scored)))]
         for _,_,item in results:
             item.access_count+=1; item.last_accessed_at=now()
@@ -530,19 +529,20 @@ class TitanExternalMemory:
         return out
 
     def reset(self) -> None:
-        self._items.clear(); self._next_id=1; self._surprise_state=0.0
+        self._items.clear(); self._next_id=1
         self.network=TitanMemoryNetwork(self.d_model, self.hidden_dim).to(self.device)
         self.optimizer=torch.optim.AdamW(self.network.memory_mlp.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        self._surprise_state=0.0
+        self.ltm=NeuralLongTermMemory(self.ltm_config).to(self.device)
+        self.ltm_state=self.ltm.init_state(self.device)
 
     def stats(self) -> Dict[str,object]:
-        return {"active_items":len(self.active_items),"inactive_items":len(self.inactive_items),"total_items":len(self.items),"d_model":self.d_model,"hidden_dim":self.hidden_dim,"device":self.device,"memory_path":str(self.memory_path) if self.memory_path else None,"memory_parameters":self.network.parameter_count(),"config":self.config.as_dict()}
+        return {"active_items":len(self.active_items),"inactive_items":len(self.inactive_items),"total_items":len(self.items),"d_model":self.d_model,"hidden_dim":self.hidden_dim,"device":self.device,"memory_path":str(self.memory_path) if self.memory_path else None,"ltm_enabled":self.use_aedelon_ltm,"ltm_parameters":self.ltm.count_parameters() if self.use_aedelon_ltm else 0}
 
     def save(self, path: Optional[Path]=None) -> None:
         target=path or self.memory_path
         if target is None: raise ValueError("No memory path configured.")
         target.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"version":2,"next_id":self._next_id,"d_model":self.d_model,"hidden_dim":self.hidden_dim,"config":self.config.as_dict(),"surprise_state":self._surprise_state,"items":[i.to_serializable() for i in self._items],"network_state":self.network.state_dict(),"optimizer_state":self.optimizer.state_dict()}, target)
+        torch.save({"version":2,"next_id":self._next_id,"d_model":self.d_model,"hidden_dim":self.hidden_dim,"items":[i.to_serializable() for i in self._items],"network_state":self.network.state_dict(),"optimizer_state":self.optimizer.state_dict(),"ltm_enabled":self.use_aedelon_ltm,"ltm_config":self.ltm_config.__dict__,"ltm_state":{"weights":[w.detach().cpu() for w in self.ltm_state.weights],"momentum":[m.detach().cpu() for m in self.ltm_state.momentum]}}, target)
 
     def load(self, path: Optional[Path]=None) -> None:
         target=path or self.memory_path
@@ -550,19 +550,27 @@ class TitanExternalMemory:
         payload=torch.load(target, map_location="cpu")
         self._items=[MemoryItem.from_serializable(x) for x in payload.get("items", [])]
         self._next_id=int(payload.get("next_id", len(self._items)+1))
-        self.network.load_state_dict(payload["network_state"]); self.network.to(self.device)
-        self._surprise_state=float(payload.get("surprise_state", 0.0))
+        if payload.get("network_state"):
+            self.network.load_state_dict(payload["network_state"]); self.network.to(self.device)
         if payload.get("optimizer_state"): self.optimizer.load_state_dict(payload["optimizer_state"])
+        if payload.get("ltm_state"):
+            raw_state=payload["ltm_state"]
+            self.ltm_state=MemoryState(
+                weights=[w.to(self.device) for w in raw_state.get("weights", [])],
+                momentum=[m.to(self.device) for m in raw_state.get("momentum", [])],
+            )
 
     def _resolve_subject(self, subject: Optional[str]) -> Optional[str]:
         if not subject or subject=="user": return subject
-        # Never collapse a full name to an existing subject with the same first
-        # name. The previous version mapped "Sarah Martin" to "Sarah Nguyen"
-        # when only one Sarah already existed, causing identity collisions.
-        if len(subject.split()) >= 2:
-            return subject
         subjects=sorted({i.subject for i in self.active_items if i.subject})
         if subject in subjects: return subject
+        # Do not collapse two different full names that share a first name.
+        # The previous logic mapped "Sarah Martin" to existing "Sarah Nguyen"
+        # when Sarah Nguyen was the only Sarah in memory, causing identity
+        # collisions and deactivating the wrong memories. Only resolve ambiguous
+        # short references such as "Sarah" to an existing full subject.
+        if len(subject.split()) > 1:
+            return subject
         first=subject.split()[0]; matches=[s for s in subjects if s and s.split()[0]==first]
         return matches[0] if len(matches)==1 else subject
 
@@ -603,7 +611,7 @@ def ask_with_memory(question: str, memory: TitanExternalMemory, ollama_model: st
     retrieved=memory.retrieve(question, k=topk, min_score=min_score)
     if debug:
         if retrieved:
-            lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} subj={d.get('subject',0.0):.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in retrieved]
+            lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in retrieved]
             box("DEBUG RETRIEVED TITAN MEMORY", "\n".join(lines), Ansi.MAGENTA)
         else:
             box("DEBUG RETRIEVED TITAN MEMORY", "No relevant memory found.", Ansi.YELLOW)
@@ -661,7 +669,7 @@ def print_store_results(results: List[Tuple[str,MemoryItem,List[MemoryItem]]]) -
 def print_search(memory: TitanExternalMemory, query: str, topk: int, min_score: float) -> None:
     res=memory.retrieve(query, k=topk, min_score=min_score)
     if not res: warn("No relevant memory found."); return
-    lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} subj={d.get('subject',0.0):.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in res]
+    lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in res]
     box("TITAN SEARCH RESULTS", "\n".join(lines), Ansi.MAGENTA)
 
 
@@ -670,7 +678,7 @@ def handle_forget(query: str, memory: TitanExternalMemory, forget_all: bool) -> 
     if not query: warn("Give a query to forget, for example: /forget Lucas secret code"); return
     candidates=memory.search_forget_candidates(query, k=8 if forget_all else 5)
     if not candidates: warn("No safe matching memory found. Nothing was deleted."); return
-    lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} subj={d.get('subject',0.0):.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in candidates]
+    lines=[f"#{i.id} | score={s:.3f} | neural={d['neural']:.3f} key={d['key']:.3f} lex={d['lexical']:.3f} ent={d['entity']:.3f} prop={d['property']:.3f} | {i.text}" for s,d,i in candidates]
     box("FORGET CANDIDATES", "\n".join(lines), Ansi.YELLOW)
     if forget_all:
         if input(color("Deactivate ALL these memories? Type YES to confirm: ", Ansi.RED)).strip()!="YES":
@@ -727,7 +735,7 @@ def handle_command(line: str, memory: TitanExternalMemory, ollama_model: str, to
 def main(argv: Optional[List[str]]=None) -> int:
     base_dir=Path(__file__).resolve().parent
     parser=argparse.ArgumentParser(description="Titan external memory for LLM agent")
-    parser.add_argument("--ollama-model", default=os.getenv("OLLAMA_MODEL", "llama3.2:1b"))
+    parser.add_argument("--ollama-model", default="gemma2:2b")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--min-score", type=float, default=0.12)
     parser.add_argument("--max-items", type=int, default=5000)
@@ -781,27 +789,60 @@ if __name__ == "__main__":
 
 
 
+
 class TitanModel:
-    def __init__(self, model_name: Optional[str] = None, max_capacity: int = 5000,
-                 config: Optional[TitanMemoryConfig] = None):
-        config = config or TitanMemoryConfig.from_env(max_items=max_capacity)
-        if model_name:
-            config.ollama_model = model_name
-        self.model_name = config.ollama_model
-        self.max_capacity = config.max_items
-        self.config = config
+    """Compatibility wrapper used by Test_models/main.py and benchmarks.
+
+    The important fix is that storing a fact must not be treated as a question.
+    Previous behavior stored the memory, then immediately asked Ollama to answer
+    the storage sentence, which produced "I do not know based on memory" in the
+    terminal even though the memory was correctly saved.
+    """
+
+    def __init__(self, model_name: str = "llama3.2:1b", max_capacity: int = 5000, config=None):
+        # Optional compatibility with the previous Titan V2 test file.
+        if config is not None:
+            model_name = getattr(config, "ollama_model", model_name)
+            max_capacity = getattr(config, "max_items", max_capacity)
+            d_model = getattr(config, "d_model", 128)
+            hidden_dim = getattr(config, "hidden_dim", 256)
+            device = getattr(config, "device", "auto")
+            learning_rate = getattr(config, "learning_rate", 0.01)
+            weight_decay = getattr(config, "weight_decay", 0.001)
+            replay_items = getattr(config, "replay_items", 8)
+            if device == "auto":
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            d_model = 128
+            hidden_dim = 256
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            learning_rate = 0.01
+            weight_decay = 0.001
+            replay_items = 8
+
+        self.model_name = model_name
+        self.max_capacity = max_capacity
         self.memory = TitanExternalMemory(
             memory_path=Path("memory_titan.pt"),
-            config=config,
+            d_model=d_model,
+            hidden_dim=hidden_dim,
+            max_items=max_capacity,
+            device=device,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            replay_items=replay_items,
+            use_aedelon_ltm=True,
         )
         self.history = []
+        self._pending_response: Optional[str] = None
+        self._last_query: Optional[str] = None
         self._set_system_prompt()
 
     def _set_system_prompt(self):
         system_prompt = (
             "You are a highly intelligent, concise, and helpful AI assistant. "
             "You always communicate in English. "
-            "Your underlying architecture relies on a lightweight Titan neural memory under the 2B-parameter budget."
+            "Your underlying architecture relies on a Titan neural memory."
         )
         self.history.append({"role": "system", "content": system_prompt})
 
@@ -813,47 +854,146 @@ class TitanModel:
 
     def get_memory_dump(self) -> str:
         active = self.memory.active_items
-        lines = [f"[bold cyan]Architecture:[/bold cyan] [bold]Titan (Neural Memory)[/bold]",
+        lines = [f"[bold cyan]Architecture:[/bold cyan] [bold]Titan (Neural Memory + Aedelon LTM)[/bold]",
                  f"[bold yellow]Active Memories:[/bold yellow] {len(active)} / {self.max_capacity}",
                  f"[bold red]Inactive Memories:[/bold red] {len(self.memory.inactive_items)}",
-                 f"[bold magenta]Memory Params:[/bold magenta] {self.memory.network.parameter_count():,}",
-                 f"[bold magenta]LLM Backend:[/bold magenta] {self.model_name}",
+                 f"[bold blue]LTM enabled:[/bold blue] {self.memory.use_aedelon_ltm}",
+                 f"[bold blue]LTM parameters:[/bold blue] {self.memory.stats().get('ltm_parameters', 0)}",
                  ""]
         if active:
             lines.append("[bold green]Recent Active Memories:[/bold green]")
             for item in sorted(active, key=lambda x: x.updated_at, reverse=True)[:10]:
                 lines.append(f"  • #{item.id} | Subj: {item.subject} | Prop: {item.property} | {item.text}")
+        else:
+            lines.append("No active memories.")
         return "\n".join(lines)
+
+    def _format_store_response(self, results: List[Tuple[str, MemoryItem, List[MemoryItem]]]) -> str:
+        if not results:
+            return "Nothing was stored."
+        lines = []
+        for action, item, deactivated in results:
+            if action == "duplicate_ignored":
+                lines.append(f"Already remembered: {item.text}")
+            elif deactivated:
+                lines.append(f"Updated memory: {item.text}")
+                lines.append("Deactivated older related memory/memories: " + ", ".join(f"#{x.id}" for x in deactivated))
+            else:
+                lines.append(f"Saved in Titan memory: {item.text}")
+        return "\n".join(lines)
+
+    def _format_search_response(self, query: str, k: int = 5, min_score: float = 0.0) -> str:
+        results = self.memory.retrieve(query, k=k, min_score=min_score)
+        if not results:
+            return "No relevant memory found."
+        lines = []
+        for score, details, item in results:
+            lines.append(
+                f"#{item.id} | score={score:.3f} | subject={item.subject} | property={item.property} | {item.text}"
+            )
+        return "\n".join(lines)
+
+    def _forget_non_interactive(self, query: str) -> str:
+        candidates = self.memory.search_forget_candidates(query, k=5)
+        if not candidates:
+            return "No safe matching memory found. Nothing was forgotten."
+        best = candidates[0][2]
+        changed = self.memory.deactivate_ids([best.id], reason=f"forgotten by query: {query}")
+        if changed:
+            return "Forgotten/deactivated: " + ", ".join(f"#{i.id} {i.text}" for i in changed)
+        return "Nothing was changed."
 
     def add_user_message(self, message: str):
         self.history.append({"role": "user", "content": message})
+        self._pending_response = None
+        self._last_query = message
+
+        stripped = message.strip()
+        lower = stripped.lower()
+
+        # Commands used by the standalone Titan CLI. They now also work in main.py.
+        if lower.startswith("/store "):
+            results = self.memory.store_text(stripped[len("/store "):].strip())
+            self._pending_response = self._format_store_response(results)
+            return
+
+        if lower.startswith("/ask "):
+            self._last_query = stripped[len("/ask "):].strip()
+            return
+
+        if lower.startswith("/search "):
+            query = stripped[len("/search "):].strip()
+            self._pending_response = self._format_search_response(query, min_score=-1.0)
+            return
+
+        if lower.startswith("/forget "):
+            query = stripped[len("/forget "):].strip()
+            self._pending_response = self._forget_non_interactive(query)
+            return
+
+        # Benchmark/main adapters use this wrapper to teach facts. Treat it as
+        # storage even if the wrapped fact itself is not recognized by the
+        # heuristic marker list.
+        for prefix in (
+            "please remember this information:",
+            "remember this information:",
+            "please remember:",
+        ):
+            if lower.startswith(prefix):
+                fact = stripped[len(prefix):].strip()
+                results = self.memory.store_text(fact)
+                self._pending_response = self._format_store_response(results)
+                return
 
         intent = classify_user_message(message)
         if intent == "store":
-            self.memory.store_text(message)
+            results = self.memory.store_text(message)
+            self._pending_response = self._format_store_response(results)
         elif intent == "forget":
-            query = re.sub(r"(?i)^please\s+(?:forget|delete|remove|erase)\s+(?:this\s*)?:?\s*", "", message).strip()
-            query = re.sub(r"(?i)\b(forget|delete|remove|erase|do not remember|don't remember)\b", "", query).strip(" :")
-            # Non-interactive API path for benchmarks/main.py. The CLI /forget
-            # command still uses handle_forget with confirmation.
-            candidates = self.memory.search_forget_candidates(query or message, k=1)
-            if candidates:
-                self.memory.deactivate_ids([candidates[0][2].id], reason=f"forgotten via API query: {query or message}")
+            query = re.sub(r"(?i)\b(forget|delete|remove|erase|do not remember|don't remember)\b", "", message).strip()
+            self._pending_response = self._forget_non_interactive(query or message)
 
     def add_assistant_message(self, message: str):
         self.history.append({"role": "assistant", "content": message})
 
+    def _direct_memory_answer(self, question: str, retrieved: List[Tuple[float, Dict[str, float], MemoryItem]]) -> Optional[str]:
+        """Return a deterministic answer when memory retrieval is unambiguous.
+
+        This prevents a very small local LLM such as llama3.2:1b from ignoring the
+        MEMORY block and saying it does not know although the right memory was
+        retrieved. The answer still comes from the memory item, not from a hardcoded
+        benchmark rule.
+        """
+        if not retrieved:
+            return None
+        best_score, details, best = retrieved[0]
+        qprop = property_key(question)
+        qents = extract_entities(question)
+        strong_match = best_score >= 0.45 or (qprop and best.property == qprop and details.get("entity", 0.0) >= 1.0)
+        if strong_match:
+            return f"Based on memory: {best.text}"
+        return None
+
     def generate_response_stream(self):
-        last_user_message = self.history[-1]['content']
-        retrieved = self.memory.retrieve(last_user_message, k=self.config.top_k, min_score=self.config.min_score)
-        
+        if self._pending_response is not None:
+            yield self._pending_response
+            self._pending_response = None
+            return
+
+        last_user_message = self._last_query or self.history[-1]['content']
+        retrieved = self.memory.retrieve(last_user_message, k=5, min_score=0.12)
+
+        direct = self._direct_memory_answer(last_user_message, retrieved)
+        if direct is not None:
+            yield direct
+            return
+
         system, user = build_prompt(last_user_message, retrieved, show_citations=False)
-        
         inference_messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
-        
+
         try:
             import ollama
             response = ollama.chat(
@@ -861,9 +1001,14 @@ class TitanModel:
                 messages=inference_messages,
                 stream=True,
             )
+            full = ""
             for chunk in response:
                 if 'message' in chunk and 'content' in chunk['message']:
-                    yield chunk['message']['content']
+                    piece = chunk['message']['content']
+                    full += piece
+                    yield piece
+            # Note: direct fallback is intentionally done before streaming to avoid
+            # printing wrong tokens and then correcting them afterwards.
         except Exception as e:
             yield f"\n[Error communicating with Ollama: {str(e)}]"
 
@@ -892,5 +1037,7 @@ class TitanModel:
 
     def clear_memory(self):
         self.history = []
+        self._pending_response = None
+        self._last_query = None
         self._set_system_prompt()
         self.memory.reset()

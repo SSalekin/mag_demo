@@ -70,7 +70,7 @@ def main():
     
     while True:
         # 1. Render UI with current memory state
-        tui.render(active_tokens=model.get_active_tokens_count(), max_capacity=model.max_capacity, dropped_tokens=model.get_dropped_tokens_count(), arch_name=arch_name)
+        tui.render(active_tokens=model.get_active_tokens_count(), max_capacity=model.max_capacity, dropped_tokens=model.get_dropped_tokens_count(), arch_name=arch_name, model_name=MODEL_NAME)
         
         # 2. Get User Input
         try:
@@ -113,7 +113,7 @@ def main():
         tui.add_chat_message("user", user_input)
         
         # We render again before generating response to show the user's message immediately
-        tui.render(active_tokens=model.get_active_tokens_count(), max_capacity=model.max_capacity, dropped_tokens=model.get_dropped_tokens_count(), arch_name=arch_name)
+        tui.render(active_tokens=model.get_active_tokens_count(), max_capacity=model.max_capacity, dropped_tokens=model.get_dropped_tokens_count(), arch_name=arch_name, model_name=MODEL_NAME)
         print("\n[AI] > Thinking...", end="\r")
         
         # 4. Generate AI Response
