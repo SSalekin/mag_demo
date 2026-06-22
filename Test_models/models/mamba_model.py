@@ -66,6 +66,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import-not-found]
@@ -1517,8 +1518,8 @@ if __name__ == "__main__":
 
 
 class MambaModel:
-    def __init__(self, model_name: str = "llama3", max_capacity: int = 5000):
-        self.model_name = model_name
+    def __init__(self, model_name: str = None, max_capacity: int = 5000):
+        self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2:1b")
         self.max_capacity = max_capacity
         self.memory = MambaVectorMemory(
             hf_model="state-spaces/mamba-130m-hf",

@@ -387,7 +387,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare Antoine memory models.")
     parser.add_argument("--models", nargs="*", default=[], choices=["transformer", "lstm", "gru", "gnn", "mamba", "titan"], help="Models to test")
     parser.add_argument("--scales", nargs="+", default=["small", "medium", "large"], choices=["small", "medium", "large"])
-    parser.add_argument("--ollama-model", default="llama3", help="Ollama model for inference")
+    parser.add_argument(
+    "--ollama-model",
+    default=os.getenv("OLLAMA_MODEL", "llama3.2:1b"),
+    help="Ollama model for inference",
+)
     parser.add_argument("--capacity", type=int, default=8192, help="Max memory capacity")
     parser.add_argument("--medium-profiles", type=int, default=30)
     parser.add_argument("--medium-distractors", type=int, default=60)

@@ -484,7 +484,10 @@ def main() -> int:
     p.add_argument("--models", nargs="*", default=[], choices=["transformer", "lstm", "gru", "gnn", "mamba", "titan"])
     p.add_argument("--scales", nargs="+", default=["small", "medium"], choices=["small", "medium", "large"])
     p.add_argument("--full-llm", action="store_true", default=True)
-    p.add_argument("--ollama-model", default="llama3")
+    p.add_argument(
+    "--ollama-model",
+    default=os.getenv("OLLAMA_MODEL", "llama3.2:1b"),
+)
     p.add_argument("--capacity", type=int, default=8192)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--min-score", type=float, default=0.12)
