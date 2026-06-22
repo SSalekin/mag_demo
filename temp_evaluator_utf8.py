@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Benchmark for Antoine Models (Transformer, LSTM, GRU)
 =====================================================
