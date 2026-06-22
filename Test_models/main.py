@@ -11,7 +11,8 @@ from ui.terminal import TUI
 def main():
     # Configuration
     MAX_KV_CAPACITY = 8192
-    MODEL_NAME = "llama3"
+    # Keep the LLM backend configurable. Default is below 2B parameters; override with OLLAMA_MODEL.
+    MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
     
     # Model Selection
     print("\n--- Architecture Selection ---")
