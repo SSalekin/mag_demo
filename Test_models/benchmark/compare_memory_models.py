@@ -237,6 +237,12 @@ class ModelAdapter:
         elif self.name == "gnn":
             from models.gnn_model import GnnModel
             return GnnModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "mamba":
+            from models.mamba_model import MambaModel
+            return MambaModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "titan":
+            from models.titan_model import TitanModel
+            return TitanModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
         raise ValueError(f"Unknown model: {self.name}")
 
     def reset(self) -> None:
@@ -379,7 +385,7 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
 
     parser = argparse.ArgumentParser(description="Compare Antoine memory models.")
-    parser.add_argument("--models", nargs="*", default=[], choices=["transformer", "lstm", "gru", "gnn"], help="Models to test")
+    parser.add_argument("--models", nargs="*", default=[], choices=["transformer", "lstm", "gru", "gnn", "mamba", "titan"], help="Models to test")
     parser.add_argument("--scales", nargs="+", default=["small", "medium", "large"], choices=["small", "medium", "large"])
     parser.add_argument("--ollama-model", default="llama3", help="Ollama model for inference")
     parser.add_argument("--capacity", type=int, default=8192, help="Max memory capacity")
@@ -397,10 +403,12 @@ def main() -> int:
         print("2. lstm")
         print("3. gru")
         print("4. gnn")
-        print("5. all")
+        print("5. mamba")
+        print("6. titan")
+        print("7. all")
         choice = input("Choice: ").strip().lower()
-        if choice == "5" or "all" in choice:
-            args.models = ["transformer", "lstm", "gru", "gnn"]
+        if choice == "7" or "all" in choice:
+            args.models = ["transformer", "lstm", "gru", "gnn", "mamba", "titan"]
         else:
             selected = []
             for part in choice.split(","):
@@ -409,9 +417,11 @@ def main() -> int:
                 elif part in ("2", "lstm"): selected.append("lstm")
                 elif part in ("3", "gru"): selected.append("gru")
                 elif part in ("4", "gnn"): selected.append("gnn")
+                elif part in ("5", "mamba"): selected.append("mamba")
+                elif part in ("6", "titan"): selected.append("titan")
             if not selected:
                 print("Invalid choice, defaulting to all models.")
-                args.models = ["transformer", "lstm", "gru", "gnn"]
+                args.models = ["transformer", "lstm", "gru", "gnn", "mamba", "titan"]
             else:
                 args.models = list(set(selected))
 

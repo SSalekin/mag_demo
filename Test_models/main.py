@@ -4,6 +4,8 @@ from models.transformer_model import TransformerModel
 from models.lstm_model import LstmModel
 from models.gru_model import GruModel
 from models.gnn_model import GnnModel
+from models.mamba_model import MambaModel
+from models.titan_model import TitanModel
 from ui.terminal import TUI
 
 def main():
@@ -17,11 +19,13 @@ def main():
     print("2. LSTM (Hidden State)")
     print("3. GRU (Hidden State)")
     print("4. GNN (Graph Neural Network)")
+    print("5. Mamba (External Memory)")
+    print("6. Titan (External Neural Memory)")
     while True:
-        choice = input("Select an architecture (1, 2, 3 or 4): ").strip()
-        if choice in ['1', '2', '3', '4']:
+        choice = input("Select an architecture (1, 2, 3, 4, 5 or 6): ").strip()
+        if choice in ['1', '2', '3', '4', '5', '6']:
             break
-        print("Invalid choice. Please enter 1, 2, 3 or 4.")
+        print("Invalid choice. Please enter 1, 2, 3, 4, 5 or 6.")
         
     if choice == '1':
         model_class = TransformerModel
@@ -35,10 +39,18 @@ def main():
         model_class = GruModel
         memory_file = "memory_gru.pt"
         arch_name = "GRU"
-    else:
+    elif choice == '4':
         model_class = GnnModel
         memory_file = "memory_gnn.pt"
         arch_name = "GNN"
+    elif choice == '5':
+        model_class = MambaModel
+        memory_file = "memory_mamba.pt"
+        arch_name = "Mamba"
+    else:
+        model_class = TitanModel
+        memory_file = "memory_titan.pt"
+        arch_name = "Titan"
         
     # Initialization
     model = model_class(model_name=MODEL_NAME, max_capacity=MAX_KV_CAPACITY)

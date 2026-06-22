@@ -687,3 +687,110 @@ def main(argv: Optional[List[str]]=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+class TitanModel:
+    def __init__(self, model_name: str = "llama3", max_capacity: int = 5000):
+        self.model_name = model_name
+        self.max_capacity = max_capacity
+        self.memory = TitanExternalMemory(
+            memory_path=Path("memory_titan.pt"),
+            d_model=128,
+            hidden_dim=256,
+            max_items=max_capacity,
+            device="cuda" if torch.cuda.is_available() else "cpu"
+        )
+        self.history = []
+        self._set_system_prompt()
+
+    def _set_system_prompt(self):
+        system_prompt = (
+            "You are a highly intelligent, concise, and helpful AI assistant. "
+            "You always communicate in English. "
+            "Your underlying architecture relies on a Titan neural memory."
+        )
+        self.history.append({"role": "system", "content": system_prompt})
+
+    def get_active_tokens_count(self) -> int:
+        return len(self.memory.active_items)
+
+    def get_dropped_tokens_count(self) -> int:
+        return len(self.memory.inactive_items)
+
+    def get_memory_dump(self) -> str:
+        active = self.memory.active_items
+        lines = [f"[bold cyan]Architecture:[/bold cyan] [bold]Titan (Neural Memory)[/bold]",
+                 f"[bold yellow]Active Memories:[/bold yellow] {len(active)} / {self.max_capacity}",
+                 f"[bold red]Inactive Memories:[/bold red] {len(self.memory.inactive_items)}",
+                 ""]
+        if active:
+            lines.append("[bold green]Recent Active Memories:[/bold green]")
+            for item in sorted(active, key=lambda x: x.updated_at, reverse=True)[:10]:
+                lines.append(f"  • #{item.id} | Subj: {item.subject} | Prop: {item.property} | {item.text}")
+        return "\n".join(lines)
+
+    def add_user_message(self, message: str):
+        self.history.append({"role": "user", "content": message})
+
+        intent = classify_user_message(message)
+        if intent == "store":
+            self.memory.store_text(message)
+        elif intent == "forget":
+            query = re.sub(r"(?i)\b(forget|delete|remove|erase|do not remember|don't remember)\b", "", message).strip()
+            handle_forget(query or message, self.memory, False)
+
+    def add_assistant_message(self, message: str):
+        self.history.append({"role": "assistant", "content": message})
+
+    def generate_response_stream(self):
+        last_user_message = self.history[-1]['content']
+        retrieved = self.memory.retrieve(last_user_message, k=5, min_score=0.12)
+        
+        system, user = build_prompt(last_user_message, retrieved, show_citations=False)
+        
+        inference_messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+        
+        try:
+            import ollama
+            response = ollama.chat(
+                model=self.model_name,
+                messages=inference_messages,
+                stream=True,
+            )
+            for chunk in response:
+                if 'message' in chunk and 'content' in chunk['message']:
+                    yield chunk['message']['content']
+        except Exception as e:
+            yield f"\n[Error communicating with Ollama: {str(e)}]"
+
+    def save_memory(self, filepath: str = "memory_titan.pt"):
+        self.memory.memory_path = Path(filepath)
+        self.memory.save()
+        import pickle
+        history_path = filepath + "_history.pkl"
+        with open(history_path, 'wb') as f:
+            pickle.dump(self.history, f)
+
+    def load_memory(self, filepath: str = "memory_titan.pt") -> bool:
+        self.memory.memory_path = Path(filepath)
+        if not self.memory.memory_path.exists():
+            return False
+        try:
+            self.memory.load()
+            import pickle, os
+            history_path = filepath + "_history.pkl"
+            if os.path.exists(history_path):
+                with open(history_path, 'rb') as f:
+                    self.history = pickle.load(f)
+            return True
+        except Exception:
+            return False
+
+    def clear_memory(self):
+        self.history = []
+        self._set_system_prompt()
+        self.memory.reset()

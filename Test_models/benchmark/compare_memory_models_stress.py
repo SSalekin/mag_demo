@@ -33,20 +33,12 @@ import re
 import statistics
 import sys
 import time
+import os
 from dataclasses import dataclass, field
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
-
-def load_module(module_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(module_name, str(path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load {module_name} from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def norm(text: str) -> str:
@@ -261,51 +253,53 @@ def build_tests(args) -> List[TestCase]:
     return tests
 
 
-class Adapter:
-    def __init__(self, name: str, module, args, memory_file: Path):
-        self.name = name
-        self.module = module
-        self.args = args
-        self.memory_file = memory_file
-        self.memory = self.create_memory()
 
-    def create_memory(self):
-        if self.name == "mamba":
-            return self.module.MambaVectorMemory(
-                hf_model=self.args.mamba_model,
-                device=self.args.device,
-                memory_path=self.memory_file,
-                max_items=self.args.max_items,
-            )
-        return self.module.TitanExternalMemory(
-            memory_path=self.memory_file,
-            d_model=self.args.titan_d_model,
-            hidden_dim=self.args.titan_hidden_dim,
-            max_items=self.args.max_items,
-            device=self.args.device,
-        )
+class Adapter:
+    def __init__(self, name: str, args):
+        self.name = name
+        self.args = args
+        self.model = self._create_model()
+
+    def _create_model(self):
+        if self.name == "transformer":
+            from models.transformer_model import TransformerModel
+            return TransformerModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "lstm":
+            from models.lstm_model import LstmModel
+            return LstmModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "gru":
+            from models.gru_model import GruModel
+            return GruModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "gnn":
+            from models.gnn_model import GnnModel
+            return GnnModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "mamba":
+            from models.mamba_model import MambaModel
+            return MambaModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        elif self.name == "titan":
+            from models.titan_model import TitanModel
+            return TitanModel(model_name=self.args.ollama_model, max_capacity=self.args.capacity)
+        raise ValueError(f"Unknown model: {self.name}")
 
     def reset(self):
-        if self.memory_file.exists():
-            self.memory_file.unlink()
-        self.memory.reset()
+        self.model.clear_memory()
 
     def store_text(self, text: str):
-        if hasattr(self.memory, "store_text"):
-            self.memory.store_text(text)
-        else:
-            self.memory.store(text)
+        self.model.add_user_message(f"Please remember this information: {text}")
+        self.model.add_assistant_message("Understood. I will remember that.")
 
     def forget(self, query: str):
-        candidates = self.memory.search_forget_candidates(query, k=1)
-        if candidates:
-            self.memory.deactivate_ids([candidates[0][2].id], reason=f"stress forget: {query}")
-
-    def retrieve(self, question: str, topk: int, min_score: float):
-        return self.memory.retrieve(question, k=topk, min_score=min_score)
+        self.model.add_user_message(f"Please forget this: {query}")
+        self.model.add_assistant_message("Acknowledged. I have forgotten it.")
 
     def ask(self, question: str, topk: int, min_score: float, ollama_model: str, debug: bool) -> str:
-        return self.module.ask_with_memory(question, self.memory, ollama_model, topk, min_score, debug, False)
+        self.model.add_user_message(question)
+        answer_chunks = []
+        for chunk in self.model.generate_response_stream():
+            answer_chunks.append(chunk)
+        answer = "".join(answer_chunks)
+        self.model.add_assistant_message(answer)
+        return answer
 
 
 def text_top(results, n: int) -> str:
@@ -323,7 +317,7 @@ def run_one(adapter: Adapter, test: TestCase, args) -> Dict[str, object]:
     store_latency = time.perf_counter() - t0
 
     t1 = time.perf_counter()
-    if args.full_llm:
+    if True:
         answer = adapter.ask(test.question, args.topk, args.min_score, args.ollama_model, args.debug)
         query_latency = time.perf_counter() - t1
         ok, reason = evaluate_text(answer, test.expected_any, test.expected_all, test.forbidden, test.category)
@@ -351,8 +345,8 @@ def run_one(adapter: Adapter, test: TestCase, args) -> Dict[str, object]:
         "reason": reason,
         "store_latency_sec": store_latency,
         "query_latency_sec": query_latency,
-        "active_memories": len(adapter.memory.active_items),
-        "inactive_memories": len(adapter.memory.inactive_items),
+        "active_memories": getattr(adapter.model, "get_active_tokens_count", lambda: 0)(),
+        "inactive_memories": getattr(adapter.model, "get_dropped_tokens_count", lambda: 0)(),
         "question": test.question,
         "expected_any": json.dumps(test.expected_any, ensure_ascii=False),
         "expected_all": json.dumps(test.expected_all, ensure_ascii=False),
@@ -485,18 +479,15 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parents[1]
 
-    p = argparse.ArgumentParser(description="Stress benchmark for Mamba and Titan memory models.")
-    p.add_argument("--models", nargs="+", default=["mamba", "titan"], choices=["mamba", "titan"])
+
+    p = argparse.ArgumentParser(description="Stress benchmark for memory models.")
+    p.add_argument("--models", nargs="*", default=[], choices=["transformer", "lstm", "gru", "gnn", "mamba", "titan"])
     p.add_argument("--scales", nargs="+", default=["small", "medium"], choices=["small", "medium", "large"])
-    p.add_argument("--full-llm", action="store_true")
-    p.add_argument("--ollama-model", default="gemma2:2b")
+    p.add_argument("--full-llm", action="store_true", default=True)
+    p.add_argument("--ollama-model", default="llama3")
+    p.add_argument("--capacity", type=int, default=8192)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--min-score", type=float, default=0.12)
-    p.add_argument("--max-items", type=int, default=8000)
-    p.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu", choices=["cpu", "cuda"])
-    p.add_argument("--mamba-model", default="state-spaces/mamba-130m-hf")
-    p.add_argument("--titan-d-model", type=int, default=128)
-    p.add_argument("--titan-hidden-dim", type=int, default=256)
     p.add_argument("--small-profiles", type=int, default=20)
     p.add_argument("--small-distractors", type=int, default=40)
     p.add_argument("--medium-profiles", type=int, default=80)
@@ -508,13 +499,37 @@ def main() -> int:
     p.add_argument("--debug", action="store_true")
     args = p.parse_args()
 
+    if not args.models:
+        print("\n--- Model Selection ---")
+        print("Select models to test (comma-separated):")
+        print("1. transformer")
+        print("2. lstm")
+        print("3. gru")
+        print("4. gnn")
+        print("5. mamba")
+        print("6. titan")
+        print("7. all")
+        choice = input("Choice: ").strip().lower()
+        if choice == "7" or "all" in choice:
+            args.models = ["transformer", "lstm", "gru", "gnn", "mamba", "titan"]
+        else:
+            selected = []
+            for part in choice.split(","):
+                part = part.strip()
+                if part in ("1", "transformer"): selected.append("transformer")
+                elif part in ("2", "lstm"): selected.append("lstm")
+                elif part in ("3", "gru"): selected.append("gru")
+                elif part in ("4", "gnn"): selected.append("gnn")
+                elif part in ("5", "mamba"): selected.append("mamba")
+                elif part in ("6", "titan"): selected.append("titan")
+            if not selected:
+                print("Invalid choice, defaulting to all models.")
+                args.models = ["transformer", "lstm", "gru", "gnn", "mamba", "titan"]
+            else:
+                args.models = list(set(selected))
+
     random.seed(args.seed)
 
-    modules = {}
-    if "mamba" in args.models:
-        modules["mamba"] = load_module("mamba_impl_stress", project_root / "elwen" / "mamba" / "mamba_implementation.py")
-    if "titan" in args.models:
-        modules["titan"] = load_module("titan_impl_stress", project_root / "elwen" / "titan" / "titan_implementation.py")
 
     output_dir = script_dir / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -528,10 +543,7 @@ def main() -> int:
     print(f"Tests per model: {len(tests)}")
     print(f"Top-k: {args.topk}\n")
 
-    adapters = {
-        model: Adapter(model, modules[model], args, output_dir / f"{model}_stress_memory_store.pt")
-        for model in args.models
-    }
+    adapters = {model: Adapter(model, args) for model in args.models}
 
     rows: List[Dict[str, object]] = []
     total = len(args.models) * len(tests)
