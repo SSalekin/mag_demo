@@ -470,7 +470,8 @@ STOPWORDS = {
     "was","were","be","been","being","as","i","me","my","mine","you","your","he","she",
     "it","they","we","his","her","their","this","that","these","those","do","does","did",
     "what","where","when","who","why","how","which","tell","give","show","more","about",
-    "please","can","could","would","should","now","currently","actually","learn","remember","that"
+    "please","can","could","would","should","now","currently","actually","learn","remember","that",
+    "ignore","random","noise","again"
 }
 QUESTION_STARTERS = ("what","where","when","who","why","how","which","do","does","did","can","could","would","should","is","are","am","tell me","explain","give me","show me")
 MEMORY_MARKERS = ("my name is","i am","i'm","i live","i study","i work","i like","i love","my favorite","my favourite","i prefer","i want","i need","i was born","remember that","note that","save this","learn that","lives in","likes","favorite color","favourite color","favorite programming language","programming language","secret code","temporary access code","student id","office room","portfolio password","research group","operating system","was born","is from","works on","studies","is currently","wants to")
@@ -479,7 +480,9 @@ FORGET_MARKERS = ("forget","delete","remove","do not remember","don't remember",
 BROAD_MEMORY_PATTERNS = ("what do you know about me","what do you remember about me","summarize my profile","summarise my profile","who am i")
 
 PROPERTY_PATTERNS: List[Tuple[str,str]] = [
-    ("secret_code", r"\bsecret code\b|\btemporary access code\b|\baccess code\b"),
+    ("secret_code", r"\bsecret code\b|\brelease secret code\b|\btemporary access code\b|\baccess code\b"),
+    ("backend_language", r"\bpreferred backend language\b|\bbackend language\b"),
+    ("documentation_style", r"\bdocumentation style\b"),
     ("student_id", r"\bstudent id\b|\bid number\b"),
     ("office_room", r"\boffice room\b|\broom\b"),
     ("password", r"\bpassword\b"),
@@ -491,6 +494,7 @@ PROPERTY_PATTERNS: List[Tuple[str,str]] = [
     ("favorite_os", r"\bfavo[u]?rite operating system\b|\boperating system\b|\bos\b"),
     ("favorite_opening", r"\bfavo[u]?rite chess opening\b|\bchess opening\b"),
     ("study", r"\bstud(?:y|ies|ying)\b|\bstudent\b|\bschool\b|\buniversity\b"),
+    ("testing_framework", r"\btesting framework\b|\bunit tests?\b|\bpytest\b"),
     ("project", r"\bproject\b|\bworking on\b|\bworks on\b|\bbuild(?:ing)?\b|\bcreate\b"),
     ("work", r"\bwork[s]?\b|\bjob\b|\bengineer\b"),
     ("current_location", r"\bcurrently\b|\bcurrent location\b|\bwhere .* currently\b"),
@@ -498,7 +502,7 @@ PROPERTY_PATTERNS: List[Tuple[str,str]] = [
     ("age", r"\bage\b|\byears old\b"),
     ("name", r"\bname\b"),
 ]
-SINGLE_VALUE_PROPERTIES = {"secret_code","student_id","office_room","password","research_group","favorite_color","favorite_food","favorite_language","favorite_os","favorite_opening","location","current_location","age","name"}
+SINGLE_VALUE_PROPERTIES = {"secret_code","student_id","office_room","password","research_group","favorite_color","favorite_food","favorite_language","favorite_os","favorite_opening","location","current_location","age","name","backend_language","documentation_style"}
 
 
 def now() -> float: return time.time()
@@ -546,6 +550,33 @@ def property_key(text: str) -> Optional[str]:
     lower=text.lower()
     for key, pattern in PROPERTY_PATTERNS:
         if re.search(pattern, lower): return key
+    return None
+
+
+def global_single_value_subject(text: str, prop: Optional[str]) -> Optional[str]:
+    """Return a stable pseudo-subject for global single-value facts.
+
+    Some useful agent memories are not attached to a named person, for example:
+    - "The preferred backend language is C++."
+    - "The release secret code is CODE-3053."
+
+    The previous update logic only deactivated old values when both subject and
+    property were detected. These global facts had a property but no subject, so
+    older values stayed active and could outrank the newest memory. We use a
+    deterministic pseudo-subject to make updates safe without affecting named
+    profiles.
+    """
+    if not prop or prop not in SINGLE_VALUE_PROPERTIES:
+        return None
+    lower = normalize_text(text)
+    if prop == "backend_language" and "backend language" in lower:
+        return "global:preferred_backend_language"
+    if prop == "secret_code" and "release secret code" in lower:
+        return "global:release_secret_code"
+    if prop == "secret_code" and "temporary access code" in lower:
+        return "global:temporary_access_code"
+    if prop == "documentation_style" and "documentation style" in lower:
+        return "global:documentation_style"
     return None
 
 
@@ -828,6 +859,8 @@ class TitanExternalMemory:
             if normalize_text(item.text)==norm:
                 item.updated_at=now(); return "duplicate_ignored", item, []
         subject=self._resolve_subject(extract_subject(text)); prop=property_key(text)
+        if subject is None:
+            subject=global_single_value_subject(text, prop)
         key,value=self._make_key_value(text); surprise=self._surprise(key,value)
         deactivated=[]
         if subject and prop and prop in SINGLE_VALUE_PROPERTIES:
@@ -1021,8 +1054,8 @@ class TitanExternalMemory:
             )
 
     def _resolve_subject(self, subject: Optional[str]) -> Optional[str]:
-        if not subject or subject=="user": return subject
-        subjects=sorted({i.subject for i in self.active_items if i.subject})
+        if not subject or subject=="user" or subject.startswith("global:"): return subject
+        subjects=sorted({i.subject for i in self.active_items if i.subject and not i.subject.startswith("global:")})
         if subject in subjects: return subject
         # Do not collapse two different full names that share a first name.
         # The previous logic mapped "Sarah Martin" to existing "Sarah Nguyen"
