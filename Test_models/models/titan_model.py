@@ -17,17 +17,402 @@ from __future__ import annotations
 import argparse, hashlib, re, shutil, time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from .titans_ltm import MemoryState, NeuralLongTermMemory, TitansMemoryConfig
-except ImportError:  # Allows running this file directly from Test_models/models.
-    from titans_ltm import MemoryState, NeuralLongTermMemory, TitansMemoryConfig
+# ---------------------------------------------------------------------------
+# Embedded Titans-style Long-Term Memory
+# ---------------------------------------------------------------------------
+# Kept in this file on purpose so the Titan model remains self-contained, like
+# the other model files in Test_models/models/. This is the memory-only part
+# inspired by Aedelon/titans-pytorch-mlx, not a full Titans LLM.
 
+ActivationName = Literal["silu", "gelu", "relu"]
+
+
+@dataclass
+class TitansMemoryConfig:
+    """Configuration for the standalone Titans long-term memory module."""
+
+    dim: int = 128
+    num_memory_layers: int = 2
+    memory_hidden_mult: float = 2.0
+    memory_lr: float = 0.05
+    memory_momentum: float = 0.90
+    memory_decay: float = 0.001
+    activation: ActivationName = "gelu"
+    init_std: float = 0.02
+
+    def __post_init__(self) -> None:
+        if self.dim <= 0:
+            raise ValueError("dim must be positive")
+        if self.num_memory_layers < 1:
+            raise ValueError("num_memory_layers must be >= 1")
+        if not 0.0 < self.memory_lr <= 1.0:
+            raise ValueError("memory_lr must be in (0, 1]")
+        if not 0.0 <= self.memory_momentum < 1.0:
+            raise ValueError("memory_momentum must be in [0, 1)")
+        if not 0.0 <= self.memory_decay < 1.0:
+            raise ValueError("memory_decay must be in [0, 1)")
+
+    @property
+    def memory_hidden_dim(self) -> int:
+        return max(self.dim, int(self.dim * self.memory_hidden_mult))
+
+
+def get_activation(name: ActivationName) -> nn.Module:
+    if name == "silu":
+        return nn.SiLU()
+    if name == "gelu":
+        return nn.GELU()
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"Unknown activation: {name}")
+
+
+@dataclass
+class MemoryState:
+    """External state of the neural memory.
+
+    weights represent M_t in the Titans paper.
+    momentum represents S_t, the accumulated surprise.
+    """
+
+    weights: list[torch.Tensor]
+    momentum: list[torch.Tensor]
+
+    def detach(self) -> "MemoryState":
+        return MemoryState(
+            weights=[w.detach().clone() for w in self.weights],
+            momentum=[m.detach().clone() for m in self.momentum],
+        )
+
+    def clone(self) -> "MemoryState":
+        return MemoryState(
+            weights=[w.clone() for w in self.weights],
+            momentum=[m.clone() for m in self.momentum],
+        )
+
+
+class MemoryMLP(nn.Module):
+    """The neural memory M.
+
+    A 1-layer memory is equivalent to a linear associative memory.
+    A 2+ layer memory is closer to the deep memory module discussed in Titans.
+    """
+
+    def __init__(self, config: TitansMemoryConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList()
+
+        if config.num_memory_layers == 1:
+            self.layers.append(nn.Linear(config.dim, config.dim, bias=False))
+        else:
+            self.layers.append(nn.Linear(config.dim, config.memory_hidden_dim, bias=False))
+            for _ in range(config.num_memory_layers - 2):
+                self.layers.append(
+                    nn.Linear(config.memory_hidden_dim, config.memory_hidden_dim, bias=False)
+                )
+            self.layers.append(nn.Linear(config.memory_hidden_dim, config.dim, bias=False))
+
+        self.activation = get_activation(config.activation)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for layer in self.layers:
+            nn.init.normal_(layer.weight, mean=0.0, std=self.config.init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for idx, layer in enumerate(self.layers):
+            h = layer(h)
+            if idx < len(self.layers) - 1:
+                h = self.activation(h)
+        return h
+
+    def get_weights(self) -> list[torch.Tensor]:
+        return [layer.weight.detach().clone() for layer in self.layers]
+
+    def set_weights(self, weights: list[torch.Tensor]) -> None:
+        if len(weights) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} weight tensors, got {len(weights)}"
+            )
+        with torch.no_grad():
+            for layer, weight in zip(self.layers, weights, strict=True):
+                layer.weight.copy_(weight.to(layer.weight.device, dtype=layer.weight.dtype))
+
+    def associative_loss(self, keys: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        return F.mse_loss(self.forward(keys), values, reduction="mean")
+
+
+class NeuralLongTermMemory(nn.Module):
+    """Standalone Titans-style Neural Long-Term Memory.
+
+    It performs retrieval using the current state, then optionally updates the
+    memory weights using the associative loss:
+
+        loss = || M(k_t) - v_t ||²
+
+    The update follows the Titans intuition:
+
+        S_t = eta * S_{t-1} - theta * grad(loss)
+        M_t = (1 - alpha) * M_{t-1} + S_t
+
+    where alpha is forgetting/decay, eta is surprise momentum, and theta is the
+    test-time memory learning rate.
+    """
+
+    def __init__(self, config: TitansMemoryConfig | None = None) -> None:
+        super().__init__()
+        self.config = config or TitansMemoryConfig()
+        dim = self.config.dim
+
+        self.proj_k = nn.Linear(dim, dim, bias=False)
+        self.proj_v = nn.Linear(dim, dim, bias=False)
+        self.proj_q = nn.Linear(dim, dim, bias=False)
+        self.proj_out = nn.Linear(dim, dim, bias=False)
+        self.memory = MemoryMLP(self.config)
+
+        self.reset_parameters()
+
+        # The projections are part of the memory interface, not trained at test time here.
+        for module in (self.proj_k, self.proj_v, self.proj_q, self.proj_out):
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+    def reset_parameters(self) -> None:
+        for module in (self.proj_k, self.proj_v, self.proj_q, self.proj_out):
+            nn.init.eye_(module.weight)
+
+    def init_state(self, device: torch.device | str = "cpu") -> MemoryState:
+        device = torch.device(device)
+        weights = [w.detach().clone().to(device) for w in self.memory.get_weights()]
+        momentum = [torch.zeros_like(w, device=device) for w in weights]
+        return MemoryState(weights=weights, momentum=momentum)
+
+    def project_keys_values_queries(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        keys = F.normalize(F.silu(self.proj_k(x)), p=2, dim=-1)
+        values = F.normalize(F.silu(self.proj_v(x)), p=2, dim=-1)
+        queries = F.normalize(F.silu(self.proj_q(x)), p=2, dim=-1)
+        return keys, values, queries
+
+    def retrieve(self, queries: torch.Tensor, state: MemoryState) -> torch.Tensor:
+        self.memory.set_weights(state.weights)
+        _, _, projected_queries = self.project_keys_values_queries(queries)
+        retrieved = self.memory(projected_queries)
+        return self.proj_out(retrieved)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: MemoryState | None = None,
+        update: bool = True,
+    ) -> tuple[torch.Tensor, MemoryState]:
+        if x.ndim != 3:
+            raise ValueError("x must have shape (batch, sequence, dim)")
+        if x.shape[-1] != self.config.dim:
+            raise ValueError(f"Expected last dim {self.config.dim}, got {x.shape[-1]}")
+
+        if state is None:
+            state = self.init_state(x.device)
+
+        self.memory.set_weights(state.weights)
+        keys, values, queries = self.project_keys_values_queries(x)
+
+        # Read before write: M*_{t-1}(q_t)
+        retrieved = self.memory(queries)
+        output = self.proj_out(retrieved)
+
+        if not update:
+            return output, state.detach()
+
+        grads = self._compute_gradients(keys, values)
+        new_state = self._update_state(state, grads)
+        return output, new_state.detach()
+
+    def _compute_gradients(
+        self, keys: torch.Tensor, values: torch.Tensor
+    ) -> list[torch.Tensor]:
+        for param in self.memory.parameters():
+            param.requires_grad_(True)
+
+        loss = self.memory.associative_loss(keys.detach(), values.detach())
+        grads = torch.autograd.grad(
+            loss,
+            list(self.memory.parameters()),
+            create_graph=False,
+            allow_unused=True,
+        )
+
+        out: list[torch.Tensor] = []
+        for grad, param in zip(grads, self.memory.parameters(), strict=True):
+            out.append(torch.zeros_like(param) if grad is None else grad.detach())
+            param.requires_grad_(False)
+        return out
+
+    def _update_state(self, state: MemoryState, grads: list[torch.Tensor]) -> MemoryState:
+        alpha = self.config.memory_decay
+        eta = self.config.memory_momentum
+        theta = self.config.memory_lr
+
+        new_weights: list[torch.Tensor] = []
+        new_momentum: list[torch.Tensor] = []
+
+        for weight, momentum, grad in zip(
+            state.weights, state.momentum, grads, strict=True
+        ):
+            grad = grad.to(weight.device, dtype=weight.dtype)
+            surprise = eta * momentum - theta * grad
+            updated_weight = (1.0 - alpha) * weight + surprise
+            new_momentum.append(surprise)
+            new_weights.append(updated_weight)
+
+        return MemoryState(weights=new_weights, momentum=new_momentum)
+
+    @staticmethod
+    def _as_sequence(x: torch.Tensor, dim: int, name: str) -> torch.Tensor:
+        """Accept either (seq, dim) or (batch, seq, dim) tensors."""
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        if x.ndim != 3:
+            raise ValueError(f"{name} must have shape (seq, dim) or (batch, seq, dim)")
+        if x.shape[-1] != dim:
+            raise ValueError(f"Expected {name} last dim {dim}, got {x.shape[-1]}")
+        return x
+
+    def _compute_gradients_from_projected(
+        self, keys: torch.Tensor, values: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Gradient of ||M(keys) - values||² for already prepared pairs."""
+        for param in self.memory.parameters():
+            param.requires_grad_(True)
+
+        loss = self.memory.associative_loss(keys.detach(), values.detach())
+        grads = torch.autograd.grad(
+            loss,
+            list(self.memory.parameters()),
+            create_graph=False,
+            allow_unused=True,
+        )
+
+        out: list[torch.Tensor] = []
+        for grad, param in zip(grads, self.memory.parameters(), strict=True):
+            out.append(torch.zeros_like(param) if grad is None else grad.detach())
+            param.requires_grad_(False)
+        return out
+
+    def consolidate(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor | None = None,
+        state: MemoryState | None = None,
+        *,
+        steps: int = 3,
+        reset_state: bool = False,
+        keep_momentum: bool = False,
+    ) -> MemoryState:
+        """Replay explicit key/value associations into the long-term memory.
+
+        This is the memory-only equivalent of the legacy Titan ``consolidate``
+        method. Instead of asking a language model to summarize text, it replays
+        the selected memory associations into the Titans LTM state.
+
+        Parameters
+        ----------
+        keys:
+            Tensor of memory keys, shape ``(seq, dim)`` or ``(batch, seq, dim)``.
+        values:
+            Tensor of target values with the same shape. If omitted, the method
+            performs self-association ``M(key) -> key`` for compatibility.
+        state:
+            Previous LTM state. If omitted, a fresh state is created.
+        steps:
+            Number of replay passes. Small values, typically 2-5, are enough.
+        reset_state:
+            If True, rebuild the LTM from scratch using only the replayed pairs.
+            This is useful after forgetting, because inactive facts are not
+            replayed and therefore do not remain reinforced in long-term state.
+        keep_momentum:
+            If False, momentum is reset before consolidation for a cleaner
+            offline replay phase.
+        """
+        if steps < 1:
+            raise ValueError("steps must be >= 1")
+
+        keys = self._as_sequence(keys, self.config.dim, "keys")
+        if values is None:
+            values = keys
+        else:
+            values = self._as_sequence(values, self.config.dim, "values")
+            if values.shape != keys.shape:
+                raise ValueError("values must have the same shape as keys")
+
+        device = keys.device
+        if state is None or reset_state:
+            state = self.init_state(device)
+        else:
+            state = state.clone()
+
+        if not keep_momentum:
+            state = MemoryState(
+                weights=[w.detach().clone().to(device) for w in state.weights],
+                momentum=[torch.zeros_like(m, device=device) for m in state.momentum],
+            )
+
+        # Use the same normalization family as the online forward path, while
+        # allowing external key/value pairs from TitanExternalMemory.
+        projected_keys = F.normalize(F.silu(keys.to(device)), p=2, dim=-1)
+        projected_values = F.normalize(F.silu(values.to(device)), p=2, dim=-1)
+
+        for _ in range(steps):
+            self.memory.set_weights(state.weights)
+            grads = self._compute_gradients_from_projected(projected_keys, projected_values)
+            state = self._update_state(state, grads).detach()
+
+        return state.detach()
+
+    def associative_loss_for_pairs(
+        self, keys: torch.Tensor, values: torch.Tensor, state: MemoryState | None = None
+    ) -> float:
+        """Measure ||M(k) - v||² for explicit pairs without updating memory."""
+        keys = self._as_sequence(keys, self.config.dim, "keys")
+        values = self._as_sequence(values, self.config.dim, "values")
+        if values.shape != keys.shape:
+            raise ValueError("values must have the same shape as keys")
+        if state is None:
+            state = self.init_state(keys.device)
+        self.memory.set_weights(state.weights)
+        projected_keys = F.normalize(F.silu(keys), p=2, dim=-1)
+        projected_values = F.normalize(F.silu(values), p=2, dim=-1)
+        with torch.no_grad():
+            loss = self.memory.associative_loss(projected_keys, projected_values)
+        return float(loss.item())
+
+    def associative_loss_for_input(
+        self, x: torch.Tensor, state: MemoryState | None = None
+    ) -> float:
+        if state is None:
+            state = self.init_state(x.device)
+        self.memory.set_weights(state.weights)
+        keys, values, _ = self.project_keys_values_queries(x)
+        with torch.no_grad():
+            loss = self.memory.associative_loss(keys, values)
+        return float(loss.item())
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Titan external memory agent
+# ---------------------------------------------------------------------------
 
 USE_COLOR = True
 
@@ -383,6 +768,7 @@ class TitanExternalMemory:
         self.ltm_state=self.ltm.init_state(device)
 
         self._items: List[MemoryItem]=[]; self._next_id=1
+        self.last_consolidated_at: Optional[float]=None
         if self.memory_path and self.memory_path.exists():
             try: self.load(self.memory_path); memory_print(f"Loaded {len(self.active_items)} active memory item(s).")
             except Exception as exc: warn(f"Could not load existing memory file: {exc}")
@@ -413,14 +799,16 @@ class TitanExternalMemory:
         steps=base_steps + min(28, int(surprise*400))
 
         if self.use_aedelon_ltm:
-            # Update the standalone Titans LTM state at test time. Unlike the
-            # older Adam-trained MLP, Titans is an online memory: a few surprise
-            # updates are enough and keep storage fast on a normal PC.
-            replay=[key] + [i.key for i in sorted(self.active_items, key=lambda i: i.updated_at, reverse=True)[:self.replay_items]]
-            x=torch.stack([k.to(self.device) for k in replay], dim=0).view(1, len(replay), self.d_model)
+            # Update the standalone Titans LTM state at test time with explicit
+            # key/value associations. This is closer to Titans' associative
+            # objective M(k) -> v than the previous self-association replay.
+            replay_items=sorted(self.active_items, key=lambda i: i.updated_at, reverse=True)[:self.replay_items]
+            replay_keys=[key] + [i.key for i in replay_items]
+            replay_values=[value] + [i.value for i in replay_items]
+            keys=torch.stack([k.to(self.device) for k in replay_keys], dim=0).view(1, len(replay_keys), self.d_model)
+            values=torch.stack([v.to(self.device) for v in replay_values], dim=0).view(1, len(replay_values), self.d_model)
             ltm_steps = 1 + min(4, int(max(0.0, surprise) * 100))
-            for _ in range(max(1, ltm_steps)):
-                _, self.ltm_state = self.ltm(x, self.ltm_state, update=True)
+            self.ltm_state = self.ltm.consolidate(keys, values, self.ltm_state, steps=max(1, ltm_steps), reset_state=False, keep_momentum=True)
             return
 
         pairs=[(key,value)] + [(i.key,i.value) for i in sorted(self.active_items, key=lambda i: i.updated_at, reverse=True)[:self.replay_items]]
@@ -466,6 +854,77 @@ class TitanExternalMemory:
                 action,_,_=self.store(u)
                 if action=="stored": created+=1
         return changed, created
+
+    def consolidate(
+        self,
+        max_items: Optional[int]=None,
+        steps: int=3,
+        reset_ltm: bool=True,
+        include_inactive: bool=False,
+    ) -> Dict[str, object]:
+        """Consolidate explicit memories into the Titans long-term memory.
+
+        The legacy Titan implementation had a ``consolidate`` method that
+        compressed all textual facts into a single consolidated summary and then
+        retrained the neural memory on it. For the new memory-only Titan, we keep
+        explicit MemoryItem objects for interpretability and targeted forgetting,
+        but we replay their key/value associations into the LTM.
+
+        By default ``reset_ltm=True`` rebuilds the neural LTM from active memories
+        only. This prevents forgotten/inactive facts from remaining reinforced in
+        the long-term state while keeping the explicit active/inactive memory list
+        unchanged.
+        """
+        source = self.items if include_inactive else self.active_items
+        if not source:
+            return {
+                "consolidated": 0,
+                "steps": steps,
+                "reset_ltm": reset_ltm,
+                "include_inactive": include_inactive,
+                "message": "Memory consolidation skipped: no memory items to consolidate.",
+            }
+
+        # Replay most important facts first: frequently used, surprising and
+        # recently updated facts are more likely to matter for future answers.
+        selected=sorted(
+            source,
+            key=lambda i: (i.access_count, i.surprise, i.updated_at),
+            reverse=True,
+        )
+        if max_items is not None:
+            selected=selected[:max(1, int(max_items))]
+
+        if self.use_aedelon_ltm:
+            keys=torch.stack([i.key.to(self.device) for i in selected], dim=0).view(1, len(selected), self.d_model)
+            values=torch.stack([i.value.to(self.device) for i in selected], dim=0).view(1, len(selected), self.d_model)
+            before=self.ltm.associative_loss_for_pairs(keys, values, self.ltm_state)
+            self.ltm_state=self.ltm.consolidate(keys, values, self.ltm_state, steps=max(1, steps), reset_state=reset_ltm, keep_momentum=False)
+            after=self.ltm.associative_loss_for_pairs(keys, values, self.ltm_state)
+        else:
+            # Fallback for the older local MLP memory. Re-train on selected
+            # explicit pairs without changing the active/inactive item list.
+            before=0.0
+            self.network.train()
+            pairs=[(i.key, i.value) for i in selected]
+            for _ in range(max(1, steps * 4)):
+                self.optimizer.zero_grad(set_to_none=True)
+                losses=[self.network.associative_loss(k.to(self.device).unsqueeze(0), v.to(self.device).unsqueeze(0)) for k,v in pairs]
+                loss=torch.stack(losses).mean(); loss.backward()
+                nn.utils.clip_grad_norm_(self.network.memory_mlp.parameters(), max_norm=1.0)
+                self.optimizer.step()
+            after=0.0
+
+        self.last_consolidated_at=now()
+        return {
+            "consolidated": len(selected),
+            "steps": steps,
+            "reset_ltm": reset_ltm,
+            "include_inactive": include_inactive,
+            "loss_before": before,
+            "loss_after": after,
+            "message": f"Consolidated {len(selected)} memory item(s) into Titans LTM.",
+        }
 
     def retrieve(self, query: str, k: int=5, min_score: float=0.12) -> List[Tuple[float,Dict[str,float],MemoryItem]]:
         active=self.active_items
@@ -536,13 +995,13 @@ class TitanExternalMemory:
         self.ltm_state=self.ltm.init_state(self.device)
 
     def stats(self) -> Dict[str,object]:
-        return {"active_items":len(self.active_items),"inactive_items":len(self.inactive_items),"total_items":len(self.items),"d_model":self.d_model,"hidden_dim":self.hidden_dim,"device":self.device,"memory_path":str(self.memory_path) if self.memory_path else None,"ltm_enabled":self.use_aedelon_ltm,"ltm_parameters":self.ltm.count_parameters() if self.use_aedelon_ltm else 0}
+        return {"active_items":len(self.active_items),"inactive_items":len(self.inactive_items),"total_items":len(self.items),"d_model":self.d_model,"hidden_dim":self.hidden_dim,"device":self.device,"memory_path":str(self.memory_path) if self.memory_path else None,"ltm_enabled":self.use_aedelon_ltm,"ltm_parameters":self.ltm.count_parameters() if self.use_aedelon_ltm else 0,"last_consolidated_at":fmt_time(self.last_consolidated_at) if self.last_consolidated_at else None}
 
     def save(self, path: Optional[Path]=None) -> None:
         target=path or self.memory_path
         if target is None: raise ValueError("No memory path configured.")
         target.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"version":2,"next_id":self._next_id,"d_model":self.d_model,"hidden_dim":self.hidden_dim,"items":[i.to_serializable() for i in self._items],"network_state":self.network.state_dict(),"optimizer_state":self.optimizer.state_dict(),"ltm_enabled":self.use_aedelon_ltm,"ltm_config":self.ltm_config.__dict__,"ltm_state":{"weights":[w.detach().cpu() for w in self.ltm_state.weights],"momentum":[m.detach().cpu() for m in self.ltm_state.momentum]}}, target)
+        torch.save({"version":2,"next_id":self._next_id,"d_model":self.d_model,"hidden_dim":self.hidden_dim,"items":[i.to_serializable() for i in self._items],"network_state":self.network.state_dict(),"optimizer_state":self.optimizer.state_dict(),"ltm_enabled":self.use_aedelon_ltm,"ltm_config":self.ltm_config.__dict__,"last_consolidated_at":self.last_consolidated_at,"ltm_state":{"weights":[w.detach().cpu() for w in self.ltm_state.weights],"momentum":[m.detach().cpu() for m in self.ltm_state.momentum]}}, target)
 
     def load(self, path: Optional[Path]=None) -> None:
         target=path or self.memory_path
@@ -550,6 +1009,7 @@ class TitanExternalMemory:
         payload=torch.load(target, map_location="cpu")
         self._items=[MemoryItem.from_serializable(x) for x in payload.get("items", [])]
         self._next_id=int(payload.get("next_id", len(self._items)+1))
+        self.last_consolidated_at=payload.get("last_consolidated_at")
         if payload.get("network_state"):
             self.network.load_state_dict(payload["network_state"]); self.network.to(self.device)
         if payload.get("optimizer_state"): self.optimizer.load_state_dict(payload["optimizer_state"])
@@ -635,6 +1095,8 @@ def print_help() -> None:
           "  /search <query>        Show retrieval results without asking Ollama\n"
           "  /forget <query>        Safely forget the best matching memory only\n"
           "  /forget --all <query>  Forget all safe matches after typing YES\n"
+          "  /consolidate           Replay active memories into Titans LTM\n"
+          "  /consolidate --keep    Consolidate without resetting LTM state\n"
           "  /memories              Show active memories\n"
           "  /memories all          Show active and inactive memories\n"
           "  /debug on | off        Show or hide retrieval details\n"
@@ -709,6 +1171,14 @@ def handle_command(line: str, memory: TitanExternalMemory, ollama_model: str, to
     if lower=="/reindex":
         changed,created=memory.atomize_existing_memories(); memory.save()
         memory_print(f"Reindexed broad memories.\nDeactivated broad items: {changed}\nCreated atomic facts: {created}"); return True
+    if lower.startswith("/consolidate"):
+        reset_ltm="--keep" not in lower
+        result=memory.consolidate(steps=3, reset_ltm=reset_ltm, include_inactive=False)
+        memory.save()
+        body=(f"{result['message']}\n"
+              f"reset_ltm={result['reset_ltm']} | steps={result['steps']}\n"
+              f"loss_before={float(result.get('loss_before',0.0)):.6f} | loss_after={float(result.get('loss_after',0.0)):.6f}")
+        memory_print(body); return True
     if lower=="/save": memory.save(); system_print("Titan memory saved."); return True
     if lower=="/load": memory.load(); system_print("Titan memory loaded."); return True
     if lower=="/reset":
@@ -929,6 +1399,16 @@ class TitanModel:
         if lower.startswith("/forget "):
             query = stripped[len("/forget "):].strip()
             self._pending_response = self._forget_non_interactive(query)
+            return
+
+        if lower.startswith("/consolidate"):
+            reset_ltm = "--keep" not in lower
+            result = self.memory.consolidate(steps=3, reset_ltm=reset_ltm, include_inactive=False)
+            self._pending_response = (
+                f"{result['message']} "
+                f"loss_before={float(result.get('loss_before', 0.0)):.6f}, "
+                f"loss_after={float(result.get('loss_after', 0.0)):.6f}."
+            )
             return
 
         # Benchmark/main adapters use this wrapper to teach facts. Treat it as
