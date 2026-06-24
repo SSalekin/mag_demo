@@ -1,0 +1,13 @@
+Agent,Taille_Prompt,Nombre_Mots,Temps_secondes,Accuracy
+Coder,Small,16,7.41,0
+Coder,Medium,370,7.02,0
+Coder,Large,1753,11.88,100
+DevOps,Small,15,4.79,0
+DevOps,Medium,369,12.52,100
+DevOps,Large,1752,15.46,100
+Tester,Small,14,4.76,100
+Tester,Medium,368,4.1,100
+Tester,Large,1751,4.01,100
+Manager,Small,22,33.29,100
+Manager,Medium,376,10.14,100
+Manager,Large,1759,34.8,100
