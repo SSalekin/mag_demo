@@ -112,7 +112,11 @@ def main() -> int:
     checks.check("Titan long-term memory was reviewed in read-only mode" in _workspace_text("README.md"), "README notes read-only memory review")
     checks.check(result.memory_candidate is not None, "result exposes a candidate memory")
     checks.check("do not store automatically" in result.memory_candidate, "candidate memory is explicitly not auto-stored")
+    checks.check(result.memory_validation.should_store is False, "read-only run keeps memory write gate disabled")
+    checks.check(result.memory_validation.stored is False, "read-only run does not store memory")
+    checks.check(result.memory_validation.store_result == "skipped_write_disabled", "read-only run reports disabled write gate")
     checks.check("Memory candidate (not stored automatically)" in result.final_message, "final message includes candidate memory")
+    checks.check("Memory validation:" in result.final_message, "final message includes memory validation gate")
 
     called_names = [call[0] for call in fake_memory.calls]
     checks.check(called_names == ["load", "recall"], "only read-side memory methods are called")

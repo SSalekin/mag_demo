@@ -76,7 +76,11 @@ def main() -> int:
     checks.check(result.qa_report.passed, "QA report passes")
     checks.check(not result.memory_context.enabled, "Titan memory is disabled by default")
     checks.check(result.memory_candidate is not None, "workflow proposes a candidate memory without storing it")
+    checks.check(result.memory_validation.should_store is False, "memory validation does not store by default")
+    checks.check(result.memory_validation.stored is False, "memory candidate is not stored by default")
+    checks.check(result.memory_validation.store_result == "skipped_write_disabled", "memory write gate is disabled by default")
     checks.check("Memory candidate (not stored automatically)" in result.final_message, "final message exposes candidate memory")
+    checks.check("Memory validation:" in result.final_message, "final message exposes memory validation gate")
     checks.check(any("syntax validation passed" in check for check in result.qa_report.checks), "QA performs syntax validation")
     checks.check(any("Docker execution skipped" in check for check in result.qa_report.checks), "Docker is skipped by default")
     checks.check("BMAD coding workflow result: APPROVED" in result.final_message, "final message summarizes approval")
@@ -98,7 +102,8 @@ def main() -> int:
     module_source = (ROOT / "agents" / "bmad_coding_team.py").read_text(encoding="utf-8").lower()
     forbidden_imports = ["import agno", "from agno", "import ollama"]
     checks.check(not any(item in module_source for item in forbidden_imports), "BMAD workflow does not import Agno or Ollama")
-    checks.check("titanagentmemory" in module_source, "BMAD step 3 has a lazy TitanAgentMemory read-only connector")
+    checks.check("titanagentmemory" in module_source, "BMAD has a lazy TitanAgentMemory connector")
+    checks.check("store_approved_memory" in module_source, "BMAD step 4 exposes an explicit memory write gate")
 
     return checks.finish()
 
