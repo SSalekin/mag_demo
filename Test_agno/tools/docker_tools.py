@@ -12,26 +12,30 @@ def create_dockerfile(content: str) -> str:
         content (str): The full content of the Dockerfile.
     """
     try:
+        # Strip markdown tags just in case
+        import re
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-zA-Z]*\n", "", content)
+            content = re.sub(r"\n```$", "", content)
+            
         with open(STAGING_DIR / "Dockerfile", "w", encoding="utf-8") as f:
             f.write(content)
-        return "Dockerfile successfully created in staging."
-    except Exception as e:
-        return f"Error creating Dockerfile: {e}"
-
-def create_docker_compose(content: str) -> str:
-    """Creates a docker-compose.yml in the staging folder.
-    
-    Args:
-        content (str): The full content of the docker-compose.yml file.
-    """
-    try:
+            
+        # Automatically generate a standard docker-compose.yml so the AI doesn't have to
+        compose_content = """version: '3.8'
+services:
+  testapp:
+    build: .
+"""
         with open(STAGING_DIR / "docker-compose.yml", "w", encoding="utf-8") as f:
-            f.write(content)
-        return "docker-compose.yml successfully created in staging."
+            f.write(compose_content)
+            
+        return "Dockerfile and docker-compose.yml successfully created in staging."
     except Exception as e:
-        return f"Error creating docker-compose: {e}"
+        return f"Error creating Docker files: {e}"
 
-def run_tests_in_docker() -> str:
+def run_tests_in_docker(**kwargs) -> str:
     """Builds and runs Docker containers in staging to launch tests.
     Returns the execution logs so the tester can evaluate the code.
     

@@ -14,9 +14,30 @@ def write_code_to_staging(filename: str, content: str) -> str:
         content (str): The source code.
     """
     try:
+        import re
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-zA-Z]*\n", "", content)
+            content = re.sub(r"\n```$", "", content)
+            
         file_path = STAGING_DIR / filename
         # Ensure subdirectories exist if filename contains a path
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Auto-import hack for 3B model
+        if filename.endswith(".py"):
+            missing_imports = ""
+            if "random" in content or "choices" in content or "choice" in content:
+                if "import random" not in content and "from random" not in content:
+                    missing_imports += "import random\n"
+            if "string" in content and "import string" not in content:
+                missing_imports += "import string\n"
+            if "secrets" in content and "import secrets" not in content:
+                missing_imports += "import secrets\n"
+            
+            if missing_imports:
+                content = missing_imports + "\n" + content
+
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
         return f"Code successfully written to staging/{filename}"
@@ -51,15 +72,31 @@ def clear_workspace() -> str:
     except Exception as e:
         return f"Error cleaning workspace: {e}"
 
+def clear_staging() -> str:
+    """Deletes all files present in the staging folder to start fresh."""
+    try:
+        for item in os.listdir(STAGING_DIR):
+            item_path = STAGING_DIR / item
+            if os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+            else:
+                os.remove(item_path)
+        return "The staging area has been completely cleaned."
+    except Exception as e:
+        return f"Error cleaning staging: {e}"
+
 def publish_to_workspace(useful_files: list = None) -> str:
     """Moves files from the staging folder to the workspace.
     If useful_files is provided, only these files (e.g., ['main.py', 'utils.py']) will be moved.
+    If not provided, it automatically filters out test files and Docker files, keeping only the strict minimum.
     The staging folder is then cleaned. To be used by the Manager after final validation.
     
     Args:
         useful_files (list, optional): List of file or folder names to keep for the user.
     """
     try:
+        from agents import estimate_and_progress
+        estimate_and_progress(0, 'DONE', 100)
         moved_files = []
         for item in os.listdir(STAGING_DIR):
             s = STAGING_DIR / item
@@ -69,9 +106,13 @@ def publish_to_workspace(useful_files: list = None) -> str:
             if item in ["Dockerfile", "docker-compose.yml"]:
                 continue
                 
-            # If useful_files is specified, ignore what is not in it
-            if useful_files is not None and item not in useful_files:
-                continue
+            # Automatically filter if no useful_files specified
+            if useful_files is None:
+                if item.startswith("test_") or item.endswith("_test.py") or item.endswith(".sh"):
+                    continue
+            else:
+                if item not in useful_files:
+                    continue
                 
             if os.path.exists(d):
                 if os.path.isdir(d):
