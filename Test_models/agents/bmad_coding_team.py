@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal BMAD-style coding team with optional Titan read-only memory.
+"""BMAD-style coding team with optional Titan memory and optional LLM generation.
 
-This is the first coding-agent orchestration prototype for the Titan memory
-project. It deliberately avoids Agno and Ollama so the basic software-factory
-workflow can be tested deterministically:
+This is the coding-agent orchestration prototype for the Titan memory
+project. Its default path remains deterministic so the basic software-factory
+workflow can be tested locally, while Step 6 can optionally delegate code
+generation to an Agno/Ollama Dev Agent:
 
 Project Manager -> Business -> Dev -> DevOps -> QA -> Evaluator
 
@@ -19,6 +20,10 @@ is written only when the caller explicitly enables ``store_approved_memory``.
 The team writes generated files to ``Test_models/staging`` through the coding
 tools added in step 1, validates them, and publishes accepted output to
 ``Test_models/workspace``.
+
+Step 7 adds an automatic repair loop: when QA fails, the Dev Agent receives the
+QA failures, rewrites the staged files, and QA runs again before the Evaluator
+rejects or approves the result.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.docker_tools import create_docker_compose, create_dockerfile, run_tests_in_docker
+from agents.bmad_llm_codegen import AgnoOllamaCodeGenerator, CodeGenerationResult, GeneratedCodeFile, LLMCodeGenerator
 from tools.file_tools import (
     STAGING_DIR,
     WORKSPACE_DIR,
@@ -150,6 +156,7 @@ class QAReport:
     checks: list[str]
     failures: list[str]
     docker_output: str | None = None
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -168,6 +175,7 @@ class BMADResult:
     memory_candidate: str | None
     memory_validation: MemoryValidationDecision
     final_message: str
+    revision_attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -408,7 +416,35 @@ class DevAgent:
     name = "Dev"
     role = "code generation"
 
+    def __init__(
+        self,
+        *,
+        code_generator: LLMCodeGenerator | None = None,
+        llm_fallback_to_template: bool = True,
+    ) -> None:
+        self.code_generator = code_generator
+        self.llm_fallback_to_template = bool(llm_fallback_to_template)
+        self.last_llm_result: CodeGenerationResult | None = None
+
     def implement(self, spec: TaskSpec) -> BMADStep:
+        llm_failure_note: str | None = None
+        if self.code_generator is not None:
+            llm_step = self._implement_with_llm(spec)
+            if llm_step is not None:
+                return llm_step
+            if self.last_llm_result and self.last_llm_result.error:
+                llm_failure_note = self.last_llm_result.error
+            if not self.llm_fallback_to_template:
+                write_file_to_staging("README.md", self._build_llm_failure_readme(spec, llm_failure_note))
+                return BMADStep(
+                    agent=self.name,
+                    role=self.role,
+                    summary="LLM generation failed and deterministic fallback is disabled.",
+                    actions=["llm_generate_code_failed", "fallback_disabled"],
+                    artifacts=[BMADArtifact(path="README.md", purpose="LLM failure report", producer=self.name)],
+                    status="failed",
+                )
+
         app_content = self._build_app(spec)
         readme_content = self._build_readme(spec)
 
@@ -426,13 +462,140 @@ class DevAgent:
             write_file_to_staging("test_app.py", self._build_test(spec))
             artifacts.append(BMADArtifact(path="test_app.py", purpose="Basic generated unittest file", producer=self.name))
 
+        actions = ["select_code_template", "write_app", "write_readme"] + (["write_tests"] if len(artifacts) > 2 else [])
+        summary = f"Generated a {_kind_label(spec.project_kind)} implementation in staging/."
+        if llm_failure_note:
+            actions = ["llm_generate_code_failed", "fallback_to_deterministic_template", *actions]
+            summary = "LLM generation failed safely; deterministic template fallback was used."
+
         return BMADStep(
             agent=self.name,
             role=self.role,
-            summary=f"Generated a {_kind_label(spec.project_kind)} implementation in staging/.",
-            actions=["select_code_template", "write_app", "write_readme"] + (["write_tests"] if len(artifacts) > 2 else []),
+            summary=summary,
+            actions=actions,
             artifacts=artifacts,
         )
+
+    def repair(self, spec: TaskSpec, qa_report: QAReport, attempt: int) -> BMADStep:
+        """Repair staged files after QA failure.
+
+        The first strategy asks the optional LLM provider to repair the current
+        staged project when it exposes a ``repair`` method. If that is not
+        available, or if the provider returns unsafe output, the Dev Agent
+        rewrites the project from the deterministic safe template. This keeps
+        the loop useful with Agno/Ollama while remaining fully testable offline.
+        """
+
+        if self.code_generator is not None and hasattr(self.code_generator, "repair"):
+            llm_step = self._repair_with_llm(spec, qa_report, attempt)
+            if llm_step is not None:
+                return llm_step
+
+        app_content = self._build_app(spec)
+        readme_content = self._build_readme(spec)
+        write_file_to_staging("app.py", app_content)
+        write_file_to_staging("README.md", readme_content)
+
+        artifacts = [
+            BMADArtifact(path="app.py", purpose="Repaired main Python entry point", producer=self.name),
+            BMADArtifact(path="README.md", purpose="Repaired usage documentation", producer=self.name),
+        ]
+        if "Include a basic test file." in spec.requirements:
+            write_file_to_staging("test_app.py", self._build_test(spec))
+            artifacts.append(BMADArtifact(path="test_app.py", purpose="Repaired unittest file", producer=self.name))
+
+        failures = "; ".join(qa_report.failures) if qa_report.failures else "unknown QA failure"
+        return BMADStep(
+            agent=self.name,
+            role=self.role,
+            summary=f"Repair cycle {attempt}: deterministic safe rewrite after QA failure: {failures[:180]}",
+            actions=["inspect_qa_failures", "repair_with_deterministic_template", "rewrite_staging_files"],
+            artifacts=artifacts,
+        )
+
+    def _implement_with_llm(self, spec: TaskSpec) -> BMADStep | None:
+        assert self.code_generator is not None
+        result = self.code_generator.generate(spec)
+        self.last_llm_result = result
+        if not result.success:
+            return None
+
+        artifacts: list[BMADArtifact] = []
+        for file in result.files:
+            write_file_to_staging(file.path, file.content)
+            artifacts.append(BMADArtifact(path=file.path, purpose=file.purpose, producer=self.name))
+
+        return BMADStep(
+            agent=self.name,
+            role=self.role,
+            summary=f"Generated project files through {result.provider}: {result.summary}",
+            actions=["llm_generate_code", "validate_llm_file_paths", "write_llm_files"],
+            artifacts=artifacts,
+        )
+
+    def _repair_with_llm(self, spec: TaskSpec, qa_report: QAReport, attempt: int) -> BMADStep | None:
+        assert self.code_generator is not None
+        repair = getattr(self.code_generator, "repair", None)
+        if repair is None:
+            return None
+
+        try:
+            result = repair(
+                spec=spec,
+                qa_failures=qa_report.failures,
+                current_files=self._read_current_staging_files(),
+                attempt=attempt,
+            )
+        except TypeError:
+            return None
+        except Exception as exc:
+            self.last_llm_result = CodeGenerationResult(
+                success=False,
+                provider="llm_repair",
+                summary="LLM repair failed before producing usable files.",
+                error=str(exc),
+            )
+            return None
+
+        self.last_llm_result = result
+        if not isinstance(result, CodeGenerationResult) or not result.success:
+            return None
+
+        artifacts: list[BMADArtifact] = []
+        for file in result.files:
+            write_file_to_staging(file.path, file.content)
+            artifacts.append(BMADArtifact(path=file.path, purpose=file.purpose, producer=self.name))
+
+        return BMADStep(
+            agent=self.name,
+            role=self.role,
+            summary=f"Repair cycle {attempt}: repaired project files through {result.provider}: {result.summary}",
+            actions=["inspect_qa_failures", "llm_repair_code", "validate_llm_file_paths", "write_repaired_llm_files"],
+            artifacts=artifacts,
+        )
+
+    @staticmethod
+    def _read_current_staging_files() -> list[GeneratedCodeFile]:
+        files: list[GeneratedCodeFile] = []
+        for path in ["app.py", "README.md", "test_app.py", "requirements.txt"]:
+            target = STAGING_DIR / path
+            if target.exists() and target.is_file():
+                files.append(GeneratedCodeFile(path=path, content=target.read_text(encoding="utf-8"), purpose="current staged file"))
+        return files
+
+    def _build_llm_failure_readme(self, spec: TaskSpec, error: str | None) -> str:
+        return f"""# LLM generation failed
+
+The BMAD Dev Agent attempted to use the configured LLM provider but could not produce safe generated files.
+
+## Original request
+
+{spec.original_request}
+
+## Error
+
+{error or 'Unknown LLM generation error.'}
+"""
 
     def _build_app(self, spec: TaskSpec) -> str:
         if spec.project_kind == "temperature_converter":
@@ -959,7 +1122,7 @@ class QAAgent:
     name = "QA"
     role = "validation"
 
-    def validate(self, run_docker: bool = False) -> tuple[QAReport, BMADStep]:
+    def validate(self, run_docker: bool = False, attempt: int = 0) -> tuple[QAReport, BMADStep]:
         checks: list[str] = []
         failures: list[str] = []
         required_files = ["app.py", "README.md", "Dockerfile", "docker-compose.yml"]
@@ -1018,11 +1181,12 @@ class QAAgent:
         else:
             checks.append("Docker execution skipped for this minimal local test.")
 
-        report = QAReport(passed=not failures, checks=checks, failures=failures, docker_output=docker_output)
+        report = QAReport(passed=not failures, checks=checks, failures=failures, docker_output=docker_output, attempt=attempt)
+        summary_prefix = f"QA attempt {attempt}" if attempt else "QA"
         step = BMADStep(
             agent=self.name,
             role=self.role,
-            summary="QA passed." if report.passed else "QA failed.",
+            summary=(f"{summary_prefix} passed." if report.passed else f"{summary_prefix} failed."),
             actions=["check_required_files", "syntax_validate", "run_generated_unit_tests"] + (["run_docker"] if run_docker else ["skip_docker"]),
             status="passed" if report.passed else "failed",
         )
@@ -1116,10 +1280,25 @@ class BMADCodingTeam:
         memory_top_k: int = 5,
         memory_min_score: float = 0.12,
         store_approved_memory: bool = False,
+        code_generator: LLMCodeGenerator | None = None,
+        use_llm: bool = False,
+        llm_provider: str = "agno_ollama",
+        ollama_model: str | None = None,
+        llm_fallback_to_template: bool = True,
+        max_revision_cycles: int = 1,
     ) -> None:
         self.project_manager = ProjectManagerAgent()
         self.business = BusinessAgent()
-        self.dev = DevAgent()
+        self.code_generator = code_generator
+        self.use_llm = bool(use_llm or code_generator is not None)
+        self.llm_provider = llm_provider
+        self.ollama_model = ollama_model
+        if self.code_generator is None and self.use_llm:
+            self.code_generator = self._build_code_generator(llm_provider=llm_provider, ollama_model=ollama_model)
+        self.dev = DevAgent(
+            code_generator=self.code_generator,
+            llm_fallback_to_template=llm_fallback_to_template,
+        )
         self.designer = DesignerAgent()
         self.devops = DevOpsAgent()
         self.qa = QAAgent()
@@ -1131,6 +1310,14 @@ class BMADCodingTeam:
         self.memory_path = Path(memory_path) if memory_path is not None else Path("agent_titan_memory.pt")
         self.memory_top_k = int(memory_top_k)
         self.memory_min_score = float(memory_min_score)
+        self.max_revision_cycles = max(0, int(max_revision_cycles))
+
+    @staticmethod
+    def _build_code_generator(*, llm_provider: str, ollama_model: str | None) -> LLMCodeGenerator:
+        normalized = (llm_provider or "agno_ollama").strip().lower()
+        if normalized in {"agno", "agno_ollama", "ollama"}:
+            return AgnoOllamaCodeGenerator(model_name=ollama_model, provider_name="agno_ollama")
+        raise ValueError(f"Unsupported BMAD LLM provider: {llm_provider!r}")
 
     def run(self, task: str, *, run_docker: bool = False, clean_workspace: bool = False) -> BMADResult:
         """Run the complete minimal coding workflow.
@@ -1158,8 +1345,17 @@ class BMADCodingTeam:
         steps.append(self.designer.review(spec))
         steps.append(self.devops.prepare_environment())
 
-        qa_report, qa_step = self.qa.validate(run_docker=run_docker)
+        qa_report, qa_step = self._run_qa(run_docker=run_docker, attempt=0)
         steps.append(qa_step)
+
+        revision_attempts = 0
+        while not qa_report.passed and revision_attempts < self.max_revision_cycles:
+            revision_attempts += 1
+            steps.append(self.dev.repair(spec, qa_report, revision_attempts))
+            steps.append(self.designer.review(spec))
+            steps.append(self.devops.prepare_environment())
+            qa_report, qa_step = self._run_qa(run_docker=run_docker, attempt=revision_attempts)
+            steps.append(qa_step)
 
         evaluation_step = self.evaluator.evaluate(spec, qa_report)
         steps.append(evaluation_step)
@@ -1178,6 +1374,7 @@ class BMADCodingTeam:
             published=published,
             workspace_files=_workspace_file_list(),
             qa_report=qa_report,
+            revision_attempts=revision_attempts,
         )
         memory_validation = self.evaluator.validate_memory_candidate(
             candidate=memory_candidate,
@@ -1203,6 +1400,7 @@ class BMADCodingTeam:
             memory_candidate=memory_candidate,
             memory_validation=memory_validation,
             final_message="",
+            revision_attempts=revision_attempts,
         )
         steps.append(self.project_manager.finish(partial_result))
 
@@ -1218,6 +1416,7 @@ class BMADCodingTeam:
             memory_context,
             memory_candidate,
             memory_validation,
+            revision_attempts,
         )
 
         return BMADResult(
@@ -1233,7 +1432,23 @@ class BMADCodingTeam:
             memory_candidate=memory_candidate,
             memory_validation=memory_validation,
             final_message=final_message,
+            revision_attempts=revision_attempts,
         )
+
+    def _run_qa(self, *, run_docker: bool, attempt: int) -> tuple[QAReport, BMADStep]:
+        """Run QA while staying compatible with simple test doubles.
+
+        Older benchmarks replace ``qa.validate`` with a tiny function that only
+        accepts ``run_docker``. The production QA accepts an ``attempt`` label so
+        retry reports are clearer.
+        """
+
+        try:
+            return self.qa.validate(run_docker=run_docker, attempt=attempt)
+        except TypeError as exc:
+            if "attempt" not in str(exc):
+                raise
+            return self.qa.validate(run_docker=run_docker)
 
     def _get_memory(self) -> ReadOnlyMemory:
         """Return the configured read-only memory object, creating Titan lazily."""
@@ -1336,6 +1551,7 @@ class BMADCodingTeam:
         published: bool,
         workspace_files: Sequence[str],
         qa_report: QAReport,
+        revision_attempts: int = 0,
     ) -> str:
         status = "approved" if approved else "rejected"
         files = ", ".join(workspace_files) if workspace_files else "none"
@@ -1343,7 +1559,8 @@ class BMADCodingTeam:
         return (
             "Candidate memory only; do not store automatically. "
             f"BMAD coding workflow {status} task={task!r}; "
-            f"published={published}; workspace_files={files}; QA={qa_status}."
+            f"published={published}; workspace_files={files}; QA={qa_status}; "
+            f"revision_attempts={revision_attempts}."
         )
 
     def _store_validated_memory(self, decision: MemoryValidationDecision) -> MemoryValidationDecision:
@@ -1410,6 +1627,7 @@ class BMADCodingTeam:
         memory_context: MemoryContext,
         memory_candidate: str | None,
         memory_validation: MemoryValidationDecision,
+        revision_attempts: int = 0,
     ) -> str:
         status = "APPROVED" if approved else "REJECTED"
         lines = [
@@ -1417,6 +1635,7 @@ class BMADCodingTeam:
             f"Task: {task}",
             f"Published: {published}",
             f"Publish result: {publish_result}",
+            f"Revision attempts: {revision_attempts}",
             "Workspace files: " + (", ".join(workspace_files) if workspace_files else "none"),
             (
                 f"Titan memory read-only: enabled, records={len(memory_context.records)}, source={memory_context.source}"
@@ -1452,6 +1671,11 @@ def run_bmad_task(
     memory_top_k: int = 5,
     memory_min_score: float = 0.12,
     store_approved_memory: bool = False,
+    use_llm: bool = False,
+    llm_provider: str = "agno_ollama",
+    ollama_model: str | None = None,
+    llm_fallback_to_template: bool = True,
+    max_revision_cycles: int = 1,
 ) -> BMADResult:
     """Convenience function for scripts and future agent integrations."""
 
@@ -1461,6 +1685,11 @@ def run_bmad_task(
         memory_top_k=memory_top_k,
         memory_min_score=memory_min_score,
         store_approved_memory=store_approved_memory,
+        use_llm=use_llm,
+        llm_provider=llm_provider,
+        ollama_model=ollama_model,
+        llm_fallback_to_template=llm_fallback_to_template,
+        max_revision_cycles=max_revision_cycles,
     ).run(task, run_docker=run_docker, clean_workspace=clean_workspace)
 
 
@@ -1474,6 +1703,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--memory-top-k", type=int, default=5, help="Number of Titan memories to retrieve.")
     parser.add_argument("--memory-min-score", type=float, default=0.12, help="Minimum Titan retrieval score.")
     parser.add_argument("--store-approved-memory", action="store_true", help="Store the validated BMAD memory candidate in Titan. Disabled by default.")
+    parser.add_argument("--use-llm", action="store_true", help="Use an optional Agno/Ollama Dev Agent for code generation, with deterministic fallback enabled.")
+    parser.add_argument("--llm-provider", default="agno_ollama", help="LLM provider for BMAD Dev generation. Currently: agno_ollama.")
+    parser.add_argument("--ollama-model", default=None, help="Ollama model for Agno generation. Defaults to OLLAMA_MODEL or llama3.2:1b.")
+    parser.add_argument("--disable-llm-fallback", action="store_true", help="Reject the workflow if LLM generation fails instead of using deterministic templates.")
+    parser.add_argument("--max-revisions", type=int, default=1, help="Maximum automatic repair cycles after QA failure. Default: 1.")
     parser.add_argument("--json", action="store_true", help="Print the full result as JSON.")
     args = parser.parse_args(argv)
 
@@ -1486,6 +1720,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         memory_top_k=args.memory_top_k,
         memory_min_score=args.memory_min_score,
         store_approved_memory=args.store_approved_memory,
+        use_llm=args.use_llm,
+        llm_provider=args.llm_provider,
+        ollama_model=args.ollama_model,
+        llm_fallback_to_template=not args.disable_llm_fallback,
+        max_revision_cycles=args.max_revisions,
     )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
