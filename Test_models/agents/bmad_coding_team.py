@@ -27,6 +27,7 @@ import argparse
 import ast
 import json
 import re
+import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -134,6 +135,9 @@ class TaskSpec:
     acceptance_criteria: list[str]
     target_language: str = "python"
     entrypoint: str = "app.py"
+    project_kind: str = "generic"
+    cli_examples: list[str] = field(default_factory=list)
+    test_command: str = "python -m unittest test_app.py"
     memory_context: str = ""
     memory_context_used: bool = False
 
@@ -213,6 +217,72 @@ def _safe_python_string(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)
 
 
+def _detect_project_kind(task: str) -> str:
+    """Detect a deterministic implementation template for the no-LLM workflow."""
+
+    lower = task.lower()
+    if any(word in lower for word in ["temperature", "celsius", "fahrenheit"]):
+        return "temperature_converter"
+    if any(word in lower for word in ["todo", "to-do", "task list", "task manager"]):
+        return "todo_cli"
+    if any(word in lower for word in ["password", "strength checker", "security score"]):
+        return "password_strength"
+    if any(word in lower for word in ["expense", "budget", "spending", "tracker"]):
+        return "expense_tracker"
+    return "generic"
+
+
+def _kind_label(project_kind: str) -> str:
+    labels = {
+        "temperature_converter": "temperature converter CLI",
+        "todo_cli": "todo-list CLI",
+        "password_strength": "password strength checker CLI",
+        "expense_tracker": "expense tracker CLI",
+        "generic": "generic Python CLI",
+    }
+    return labels.get(project_kind, "generic Python CLI")
+
+
+def _kind_requirements(project_kind: str) -> list[str]:
+    if project_kind == "temperature_converter":
+        return [
+            "Implement Celsius to Fahrenheit conversion.",
+            "Implement Fahrenheit to Celsius conversion.",
+            "Expose CLI flags for both conversion directions.",
+        ]
+    if project_kind == "todo_cli":
+        return [
+            "Implement add, list and clear operations for todo items.",
+            "Keep todo persistence in a simple local text file by default.",
+            "Expose CLI subcommands for each todo operation.",
+        ]
+    if project_kind == "password_strength":
+        return [
+            "Analyze password length, lowercase, uppercase, digit and symbol coverage.",
+            "Return a score and a human-readable strength label.",
+            "Expose a CLI argument for checking one password.",
+        ]
+    if project_kind == "expense_tracker":
+        return [
+            "Implement expense storage in a small JSON file by default.",
+            "Implement add, list and total operations.",
+            "Expose CLI subcommands for each expense operation.",
+        ]
+    return ["Expose a simple command-line entry point."]
+
+
+def _kind_cli_examples(project_kind: str) -> list[str]:
+    if project_kind == "temperature_converter":
+        return ["python app.py --celsius 20", "python app.py --fahrenheit 68"]
+    if project_kind == "todo_cli":
+        return ["python app.py add 'Write benchmark'", "python app.py list", "python app.py clear"]
+    if project_kind == "password_strength":
+        return ["python app.py 'StrongerPass123!'"]
+    if project_kind == "expense_tracker":
+        return ["python app.py add 'Coffee' 2.50", "python app.py list", "python app.py total"]
+    return ["python app.py"]
+
+
 # ---------------------------------------------------------------------------
 # BMAD roles
 # ---------------------------------------------------------------------------
@@ -282,16 +352,20 @@ class BusinessAgent:
         project_name = _slugify(title)
         lower = task.lower()
         memory_text = memory_context.context.lower() if memory_context and memory_context.enabled else ""
+        project_kind = _detect_project_kind(task)
+        kind_label = _kind_label(project_kind)
 
         requirements = [
             "Create a small, readable Python implementation.",
             "Keep the result self-contained inside staging before validation.",
             "Include a README explaining how to run the generated code.",
         ]
-        if any(word in lower for word in ["test", "pytest", "unit"]) or "pytest" in memory_text:
+        requirements.extend(_kind_requirements(project_kind))
+        if any(word in lower for word in ["test", "pytest", "unit"]) or "pytest" in memory_text or "test" in memory_text:
             requirements.append("Include a basic test file.")
         if any(word in lower for word in ["cli", "terminal", "command"]):
-            requirements.append("Expose a simple command-line entry point.")
+            if "Expose a simple command-line entry point." not in requirements:
+                requirements.append("Expose a simple command-line entry point.")
         if memory_context and memory_context.enabled:
             requirements.append("Review retrieved Titan memory context in read-only mode before implementation.")
 
@@ -299,6 +373,8 @@ class BusinessAgent:
             "app.py exists in staging.",
             "README.md exists in staging.",
             "Generated Python code passes syntax validation.",
+            "Generated unit tests pass locally when test_app.py is present.",
+            f"Generated app matches the selected template: {kind_label}.",
             "Evaluator approves before publishing to workspace.",
         ]
         if memory_context and memory_context.enabled:
@@ -307,9 +383,11 @@ class BusinessAgent:
         spec = TaskSpec(
             original_request=task,
             project_name=project_name,
-            goal=f"Build a minimal Python artifact for: {task}",
+            goal=f"Build a useful {kind_label} for: {task}",
             requirements=requirements,
             acceptance_criteria=acceptance_criteria,
+            project_kind=project_kind,
+            cli_examples=_kind_cli_examples(project_kind),
             memory_context=memory_context.context if memory_context and memory_context.enabled else "",
             memory_context_used=bool(memory_context and memory_context.enabled),
         )
@@ -317,10 +395,10 @@ class BusinessAgent:
             agent=self.name,
             role=self.role,
             summary=(
-                f"Defined a minimal functional spec for '{title}'"
+                f"Defined a functional spec for a {kind_label} ('{title}')"
                 + (" using read-only Titan context." if memory_context and memory_context.enabled else ".")
             ),
-            actions=["define_goal", "define_requirements", "define_acceptance_criteria"]
+            actions=["define_goal", "detect_project_template", "define_requirements", "define_acceptance_criteria"]
             + (["consume_read_only_memory_context"] if memory_context and memory_context.enabled else []),
         )
         return spec, step
@@ -338,25 +416,36 @@ class DevAgent:
         write_file_to_staging("README.md", readme_content)
 
         artifacts = [
-            BMADArtifact(path="app.py", purpose="Main generated Python entry point", producer=self.name),
+            BMADArtifact(path="app.py", purpose=f"Main generated Python entry point ({_kind_label(spec.project_kind)})", producer=self.name),
             BMADArtifact(path="README.md", purpose="Usage and project explanation", producer=self.name),
         ]
 
-        # If the Business Agent asked for a test, generate one. This keeps the
-        # workflow deterministic but still supports test-oriented requests.
+        # If the Business Agent asked for a test, generate a runnable unittest
+        # file. This gives QA a real local test command without requiring pytest.
         if "Include a basic test file." in spec.requirements:
             write_file_to_staging("test_app.py", self._build_test(spec))
-            artifacts.append(BMADArtifact(path="test_app.py", purpose="Basic generated unit test", producer=self.name))
+            artifacts.append(BMADArtifact(path="test_app.py", purpose="Basic generated unittest file", producer=self.name))
 
         return BMADStep(
             agent=self.name,
             role=self.role,
-            summary="Generated the first implementation files in staging/.",
-            actions=["write_app", "write_readme"] + (["write_tests"] if len(artifacts) > 2 else []),
+            summary=f"Generated a {_kind_label(spec.project_kind)} implementation in staging/.",
+            actions=["select_code_template", "write_app", "write_readme"] + (["write_tests"] if len(artifacts) > 2 else []),
             artifacts=artifacts,
         )
 
     def _build_app(self, spec: TaskSpec) -> str:
+        if spec.project_kind == "temperature_converter":
+            return self._build_temperature_app(spec)
+        if spec.project_kind == "todo_cli":
+            return self._build_todo_app(spec)
+        if spec.project_kind == "password_strength":
+            return self._build_password_app(spec)
+        if spec.project_kind == "expense_tracker":
+            return self._build_expense_app(spec)
+        return self._build_generic_app(spec)
+
+    def _build_generic_app(self, spec: TaskSpec) -> str:
         title = _extract_title(spec.original_request)
         goal = _safe_python_string(spec.goal)
         request = _safe_python_string(spec.original_request)
@@ -391,9 +480,282 @@ if __name__ == "__main__":
     main()
 '''
 
+    def _build_temperature_app(self, spec: TaskSpec) -> str:
+        request = _safe_python_string(spec.original_request)
+        return f'''"""Temperature converter CLI generated by the BMAD coding team.
+
+Request: {spec.original_request}
+"""
+
+from __future__ import annotations
+
+import argparse
+
+REQUEST = {request}
+
+
+def celsius_to_fahrenheit(celsius: float) -> float:
+    """Convert Celsius to Fahrenheit."""
+
+    return (celsius * 9 / 5) + 32
+
+
+def fahrenheit_to_celsius(fahrenheit: float) -> float:
+    """Convert Fahrenheit to Celsius."""
+
+    return (fahrenheit - 32) * 5 / 9
+
+
+def format_temperature(value: float, unit: str) -> str:
+    """Format a temperature with two decimals and a unit."""
+
+    return f"{{value:.2f}} °{{unit}}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Convert temperatures between Celsius and Fahrenheit.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--celsius", type=float, help="Temperature in Celsius to convert to Fahrenheit.")
+    group.add_argument("--fahrenheit", type=float, help="Temperature in Fahrenheit to convert to Celsius.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.celsius is not None:
+        print(format_temperature(celsius_to_fahrenheit(args.celsius), "F"))
+    else:
+        print(format_temperature(fahrenheit_to_celsius(args.fahrenheit), "C"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+    def _build_todo_app(self, spec: TaskSpec) -> str:
+        request = _safe_python_string(spec.original_request)
+        return f'''"""Todo-list CLI generated by the BMAD coding team.
+
+Request: {spec.original_request}
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+REQUEST = {request}
+DEFAULT_TODO_FILE = Path("todo.txt")
+
+
+def load_items(path: Path = DEFAULT_TODO_FILE) -> list[str]:
+    """Load todo items from a text file."""
+
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def save_items(items: list[str], path: Path = DEFAULT_TODO_FILE) -> None:
+    """Save todo items to a text file."""
+
+    path.write_text("\\n".join(items) + ("\\n" if items else ""), encoding="utf-8")
+
+
+def add_item(text: str, path: Path = DEFAULT_TODO_FILE) -> list[str]:
+    """Add one todo item and return the updated list."""
+
+    item = text.strip()
+    if not item:
+        raise ValueError("Todo item cannot be empty.")
+    items = load_items(path)
+    items.append(item)
+    save_items(items, path)
+    return items
+
+
+def clear_items(path: Path = DEFAULT_TODO_FILE) -> None:
+    """Remove all todo items."""
+
+    if path.exists():
+        path.unlink()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage a small local todo list.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    add_parser = subparsers.add_parser("add", help="Add a todo item.")
+    add_parser.add_argument("text", help="Todo item text.")
+
+    subparsers.add_parser("list", help="List todo items.")
+    subparsers.add_parser("clear", help="Clear all todo items.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "add":
+        items = add_item(args.text)
+        print(f"Added item #{{len(items)}}: {{args.text}}")
+    elif args.command == "list":
+        items = load_items()
+        if not items:
+            print("No todo items.")
+        for index, item in enumerate(items, start=1):
+            print(f"{{index}}. {{item}}")
+    elif args.command == "clear":
+        clear_items()
+        print("Todo list cleared.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+    def _build_password_app(self, spec: TaskSpec) -> str:
+        request = _safe_python_string(spec.original_request)
+        return f'''"""Password strength checker CLI generated by the BMAD coding team.
+
+Request: {spec.original_request}
+"""
+
+from __future__ import annotations
+
+import argparse
+import string
+
+REQUEST = {request}
+
+
+def analyze_password(password: str) -> dict[str, object]:
+    """Return a simple strength analysis for a password."""
+
+    checks = {{
+        "length_at_least_8": len(password) >= 8,
+        "has_lowercase": any(char.islower() for char in password),
+        "has_uppercase": any(char.isupper() for char in password),
+        "has_digit": any(char.isdigit() for char in password),
+        "has_symbol": any(char in string.punctuation for char in password),
+    }}
+    score = sum(1 for passed in checks.values() if passed)
+    if score <= 2:
+        label = "weak"
+    elif score <= 4:
+        label = "medium"
+    else:
+        label = "strong"
+    return {{"score": score, "label": label, "checks": checks}}
+
+
+def build_report(password: str) -> str:
+    result = analyze_password(password)
+    return f"Password strength: {{result['label']}} ({{result['score']}}/5)"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Check password strength with simple deterministic rules.")
+    parser.add_argument("password", help="Password to analyze.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    print(build_report(args.password))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+    def _build_expense_app(self, spec: TaskSpec) -> str:
+        request = _safe_python_string(spec.original_request)
+        return f'''"""Expense tracker CLI generated by the BMAD coding team.
+
+Request: {spec.original_request}
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+REQUEST = {request}
+DEFAULT_EXPENSE_FILE = Path("expenses.json")
+
+
+def load_expenses(path: Path = DEFAULT_EXPENSE_FILE) -> list[dict[str, float | str]]:
+    """Load expenses from a JSON file."""
+
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Expense file must contain a list.")
+    return data
+
+
+def save_expenses(expenses: list[dict[str, float | str]], path: Path = DEFAULT_EXPENSE_FILE) -> None:
+    """Save expenses to a JSON file."""
+
+    path.write_text(json.dumps(expenses, indent=2), encoding="utf-8")
+
+
+def add_expense(description: str, amount: float, path: Path = DEFAULT_EXPENSE_FILE) -> list[dict[str, float | str]]:
+    """Add one expense and return all expenses."""
+
+    if amount < 0:
+        raise ValueError("Expense amount cannot be negative.")
+    expenses = load_expenses(path)
+    expenses.append({{"description": description.strip(), "amount": float(amount)}})
+    save_expenses(expenses, path)
+    return expenses
+
+
+def total_expenses(expenses: list[dict[str, float | str]]) -> float:
+    """Return the total amount for all expenses."""
+
+    return sum(float(item["amount"]) for item in expenses)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Track simple local expenses.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    add_parser = subparsers.add_parser("add", help="Add an expense.")
+    add_parser.add_argument("description", help="Expense description.")
+    add_parser.add_argument("amount", type=float, help="Expense amount.")
+
+    subparsers.add_parser("list", help="List expenses.")
+    subparsers.add_parser("total", help="Show total expenses.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.command == "add":
+        expenses = add_expense(args.description, args.amount)
+        print(f"Added expense #{{len(expenses)}}: {{args.description}} = {{args.amount:.2f}}")
+    elif args.command == "list":
+        for index, item in enumerate(load_expenses(), start=1):
+            print(f"{{index}}. {{item['description']}} - {{float(item['amount']):.2f}}")
+    elif args.command == "total":
+        print(f"Total: {{total_expenses(load_expenses()):.2f}}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
     def _build_readme(self, spec: TaskSpec) -> str:
         requirements = "\n".join(f"- {item}" for item in spec.requirements)
         criteria = "\n".join(f"- {item}" for item in spec.acceptance_criteria)
+        cli_examples = "\n".join(f"```bash\n{example}\n```" for example in spec.cli_examples)
         memory_section = ""
         if spec.memory_context_used:
             memory_section = (
@@ -402,9 +764,23 @@ if __name__ == "__main__":
                 "No memory write was performed automatically.\n"
             )
 
+        test_section = ""
+        if "Include a basic test file." in spec.requirements:
+            test_section = f"""
+## Test
+
+```bash
+{spec.test_command}
+```
+"""
+
         return f"""# {_extract_title(spec.original_request)}
 
 Generated by the minimal BMAD coding team.
+
+## Selected template
+
+{_kind_label(spec.project_kind)}
 
 ## Original request
 
@@ -424,23 +800,117 @@ Generated by the minimal BMAD coding team.
 {memory_section}
 ## Run
 
-```bash
-python app.py
-```
-"""
+{cli_examples}
+{test_section}"""
 
     def _build_test(self, spec: TaskSpec) -> str:
-        return f'''from app import describe_project
+        if spec.project_kind == "temperature_converter":
+            return '''import unittest
+
+from app import celsius_to_fahrenheit, fahrenheit_to_celsius, format_temperature
 
 
-def test_describe_project_contains_request() -> None:
-    project = describe_project()
-    assert project["name"] == "{spec.project_name}"
-    assert {json.dumps(spec.original_request)} in project["request"]
+class TestTemperatureConverter(unittest.TestCase):
+    def test_celsius_to_fahrenheit(self) -> None:
+        self.assertAlmostEqual(celsius_to_fahrenheit(0), 32.0)
+        self.assertAlmostEqual(celsius_to_fahrenheit(100), 212.0)
+
+    def test_fahrenheit_to_celsius(self) -> None:
+        self.assertAlmostEqual(fahrenheit_to_celsius(32), 0.0)
+        self.assertAlmostEqual(fahrenheit_to_celsius(212), 100.0)
+
+    def test_format_temperature(self) -> None:
+        self.assertEqual(format_temperature(68, "F"), "68.00 °F")
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+        if spec.project_kind == "todo_cli":
+            return '''import tempfile
+import unittest
+from pathlib import Path
+
+from app import add_item, clear_items, load_items
+
+
+class TestTodoCli(unittest.TestCase):
+    def test_add_and_clear_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "todo.txt"
+            add_item("Write tests", path)
+            add_item("Run QA", path)
+            self.assertEqual(load_items(path), ["Write tests", "Run QA"])
+            clear_items(path)
+            self.assertEqual(load_items(path), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+        if spec.project_kind == "password_strength":
+            return '''import unittest
+
+from app import analyze_password, build_report
+
+
+class TestPasswordStrength(unittest.TestCase):
+    def test_strong_password(self) -> None:
+        result = analyze_password("StrongerPass123!")
+        self.assertEqual(result["label"], "strong")
+        self.assertEqual(result["score"], 5)
+
+    def test_weak_password(self) -> None:
+        result = analyze_password("abc")
+        self.assertEqual(result["label"], "weak")
+
+    def test_report_contains_label(self) -> None:
+        self.assertIn("Password strength:", build_report("StrongerPass123!"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+        if spec.project_kind == "expense_tracker":
+            return '''import tempfile
+import unittest
+from pathlib import Path
+
+from app import add_expense, load_expenses, total_expenses
+
+
+class TestExpenseTracker(unittest.TestCase):
+    def test_add_and_total_expenses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "expenses.json"
+            expenses = add_expense("Coffee", 2.5, path)
+            expenses = add_expense("Lunch", 12.0, path)
+            self.assertEqual(len(load_expenses(path)), 2)
+            self.assertAlmostEqual(total_expenses(expenses), 14.5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+        return f'''import unittest
+
+from app import describe_project
+
+
+class TestGeneratedProject(unittest.TestCase):
+    def test_describe_project_contains_request(self) -> None:
+        project = describe_project()
+        self.assertEqual(project["name"], "{spec.project_name}")
+        self.assertIn({json.dumps(spec.original_request)}, project["request"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 '''
 
 
 class DesignerAgent:
+
     name = "Designer"
     role = "documentation and user experience"
 
@@ -511,11 +981,33 @@ class QAAgent:
 
         test_path = STAGING_DIR / "test_app.py"
         if test_path.exists():
+            test_syntax_ok = False
             try:
                 ast.parse(test_path.read_text(encoding="utf-8"))
                 checks.append("test_app.py syntax validation passed.")
+                test_syntax_ok = True
             except SyntaxError as exc:
                 failures.append(f"test_app.py syntax error: {exc}")
+
+            if test_syntax_ok:
+                try:
+                    completed = subprocess.run(
+                        [sys.executable, "-m", "unittest", "test_app.py"],
+                        cwd=STAGING_DIR,
+                        text=True,
+                        capture_output=True,
+                        timeout=20,
+                    )
+                    checks.append("Generated unit tests executed locally.")
+                    if completed.returncode == 0:
+                        checks.append("Generated unit tests passed locally.")
+                    else:
+                        failures.append(
+                            "Generated unit tests failed locally: "
+                            + (completed.stdout + completed.stderr).strip()[:800]
+                        )
+                except Exception as exc:
+                    failures.append(f"Generated unit tests could not be executed locally: {exc}")
 
         docker_output: str | None = None
         if run_docker:
@@ -531,7 +1023,7 @@ class QAAgent:
             agent=self.name,
             role=self.role,
             summary="QA passed." if report.passed else "QA failed.",
-            actions=["check_required_files", "syntax_validate"] + (["run_docker"] if run_docker else ["skip_docker"]),
+            actions=["check_required_files", "syntax_validate", "run_generated_unit_tests"] + (["run_docker"] if run_docker else ["skip_docker"]),
             status="passed" if report.passed else "failed",
         )
         return report, step
