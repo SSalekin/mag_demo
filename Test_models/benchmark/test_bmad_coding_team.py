@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Minimal checks for the deterministic BMAD coding team.
 
-This test intentionally does not use Agno, Ollama or Titan. It only validates the
-new orchestration layer and the staging/workspace tools.
+This test intentionally does not use Agno or Ollama. It keeps Titan disabled by
+default and validates the orchestration layer plus the staging/workspace tools.
 """
 
 from __future__ import annotations
@@ -74,6 +74,9 @@ def main() -> int:
     actual_order = [step.agent for step in result.steps]
     checks.check(actual_order == expected_order, "BMAD agents run in the expected order")
     checks.check(result.qa_report.passed, "QA report passes")
+    checks.check(not result.memory_context.enabled, "Titan memory is disabled by default")
+    checks.check(result.memory_candidate is not None, "workflow proposes a candidate memory without storing it")
+    checks.check("Memory candidate (not stored automatically)" in result.final_message, "final message exposes candidate memory")
     checks.check(any("syntax validation passed" in check for check in result.qa_report.checks), "QA performs syntax validation")
     checks.check(any("Docker execution skipped" in check for check in result.qa_report.checks), "Docker is skipped by default")
     checks.check("BMAD coding workflow result: APPROVED" in result.final_message, "final message summarizes approval")
@@ -93,8 +96,9 @@ def main() -> int:
     checks.check(empty_task_failed, "empty tasks are rejected")
 
     module_source = (ROOT / "agents" / "bmad_coding_team.py").read_text(encoding="utf-8").lower()
-    forbidden_imports = ["import agno", "from agno", "import ollama", "from models.titan_model", "titanagentmemory"]
-    checks.check(not any(item in module_source for item in forbidden_imports), "BMAD step 2 does not import Agno, Ollama or Titan")
+    forbidden_imports = ["import agno", "from agno", "import ollama"]
+    checks.check(not any(item in module_source for item in forbidden_imports), "BMAD workflow does not import Agno or Ollama")
+    checks.check("titanagentmemory" in module_source, "BMAD step 3 has a lazy TitanAgentMemory read-only connector")
 
     return checks.finish()
 
