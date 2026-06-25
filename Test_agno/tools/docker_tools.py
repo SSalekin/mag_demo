@@ -6,40 +6,40 @@ STAGING_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 WORKSPACE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "workspace"
 
 def create_dockerfile(content: str) -> str:
-    """Crée un Dockerfile dans le dossier de staging pour l'environnement de test.
+    """Creates a Dockerfile in the staging folder for the test environment.
     
     Args:
-        content (str): Le contenu complet du Dockerfile.
+        content (str): The full content of the Dockerfile.
     """
     try:
         with open(STAGING_DIR / "Dockerfile", "w", encoding="utf-8") as f:
             f.write(content)
-        return "Dockerfile créé avec succès dans staging."
+        return "Dockerfile successfully created in staging."
     except Exception as e:
-        return f"Erreur lors de la création du Dockerfile : {e}"
+        return f"Error creating Dockerfile: {e}"
 
 def create_docker_compose(content: str) -> str:
-    """Crée un docker-compose.yml dans le dossier de staging.
+    """Creates a docker-compose.yml in the staging folder.
     
     Args:
-        content (str): Le contenu complet du fichier docker-compose.yml.
+        content (str): The full content of the docker-compose.yml file.
     """
     try:
         with open(STAGING_DIR / "docker-compose.yml", "w", encoding="utf-8") as f:
             f.write(content)
-        return "docker-compose.yml créé avec succès dans staging."
+        return "docker-compose.yml successfully created in staging."
     except Exception as e:
-        return f"Erreur lors de la création de docker-compose : {e}"
+        return f"Error creating docker-compose: {e}"
 
 def run_tests_in_docker() -> str:
-    """Construit et exécute les conteneurs Docker dans le staging pour lancer les tests.
-    Retourne les logs de l'exécution pour que le testeur puisse évaluer le code.
+    """Builds and runs Docker containers in staging to launch tests.
+    Returns the execution logs so the tester can evaluate the code.
     
     Returns:
-        str: Les logs complets d'exécution (stdout et stderr).
+        str: The full execution logs (stdout and stderr).
     """
     try:
-        # Exécute docker compose up --build --abort-on-container-exit
+        # Run docker compose up --build --abort-on-container-exit
         result = subprocess.run(
             ["docker", "compose", "up", "--build", "--abort-on-container-exit"],
             cwd=str(STAGING_DIR),
@@ -50,21 +50,21 @@ def run_tests_in_docker() -> str:
             timeout=300 # 5 minutes max
         )
         
-        # Troncature pour éviter de saturer le contexte du LLM (max 4000 caractères à la fin)
+        # Truncate to avoid overloading the LLM context (max 4000 characters at the end)
         stdout_str = result.stdout[-4000:] if result.stdout and len(result.stdout) > 4000 else result.stdout
         stderr_str = result.stderr[-4000:] if result.stderr and len(result.stderr) > 4000 else result.stderr
 
-        output = f"Code de retour : {result.returncode}\n\n"
-        output += f"--- STDOUT (tronqué) ---\n{stdout_str}\n"
+        output = f"Return code: {result.returncode}\n\n"
+        output += f"--- STDOUT (truncated) ---\n{stdout_str}\n"
         if stderr_str:
-            output += f"--- STDERR (tronqué) ---\n{stderr_str}\n"
+            output += f"--- STDERR (truncated) ---\n{stderr_str}\n"
             
-        # Nettoyage
+        # Cleanup
         subprocess.run(["docker", "compose", "down"], cwd=str(STAGING_DIR), capture_output=True)
         
         return output
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "compose", "down"], cwd=str(STAGING_DIR), capture_output=True)
-        return "Erreur: L'exécution a dépassé le temps limite de 5 minutes."
+        return "Error: Execution exceeded the 5-minute time limit."
     except Exception as e:
-        return f"Erreur d'exécution Docker : {e}"
+        return f"Docker execution error: {e}"

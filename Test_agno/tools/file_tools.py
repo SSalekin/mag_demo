@@ -6,12 +6,12 @@ STAGING_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 WORKSPACE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "workspace"
 
 def write_code_to_staging(filename: str, content: str) -> str:
-    """Écrit un fichier de code dans le dossier de staging (mémoire de travail temporaire).
-    Le Coder Agent utilise cet outil pour créer les fichiers sources et de tests.
+    """Writes a code file to the staging folder (temporary working memory).
+    The Coder Agent uses this tool to create source and test files.
     
     Args:
-        filename (str): Le nom du fichier (ex: 'main.py' ou 'test_main.py').
-        content (str): Le code source.
+        filename (str): The name of the file (e.g., 'main.py' or 'test_main.py').
+        content (str): The source code.
     """
     try:
         file_path = STAGING_DIR / filename
@@ -19,26 +19,26 @@ def write_code_to_staging(filename: str, content: str) -> str:
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
-        return f"Code écrit avec succès dans staging/{filename}"
+        return f"Code successfully written to staging/{filename}"
     except Exception as e:
-        return f"Erreur lors de l'écriture dans staging : {e}"
+        return f"Error writing to staging: {e}"
 
 def list_staging_files() -> str:
-    """Liste tous les fichiers présents dans le dossier de staging."""
+    """Lists all files present in the staging folder."""
     try:
         files = []
         for root, dirs, filenames in os.walk(STAGING_DIR):
             for f in filenames:
                 files.append(os.path.relpath(os.path.join(root, f), STAGING_DIR))
         if not files:
-            return "Le dossier de staging est vide."
-        return "Fichiers dans staging:\n" + "\n".join(files)
+            return "The staging folder is empty."
+        return "Files in staging:\n" + "\n".join(files)
     except Exception as e:
-        return f"Erreur lors du listage de staging : {e}"
+        return f"Error listing staging folder: {e}"
 
 def clear_workspace() -> str:
-    """Supprime tous les fichiers présents dans le dossier workspace.
-    À utiliser si l'utilisateur a donné son accord pour nettoyer le dossier.
+    """Deletes all files present in the workspace folder.
+    To be used if the user has given their permission to clean the folder.
     """
     try:
         for item in os.listdir(WORKSPACE_DIR):
@@ -47,17 +47,17 @@ def clear_workspace() -> str:
                 shutil.rmtree(item_path)
             else:
                 os.remove(item_path)
-        return "Le workspace a été entièrement nettoyé."
+        return "The workspace has been completely cleaned."
     except Exception as e:
-        return f"Erreur lors du nettoyage du workspace : {e}"
+        return f"Error cleaning workspace: {e}"
 
 def publish_to_workspace(useful_files: list = None) -> str:
-    """Déplace les fichiers du dossier de staging vers le workspace.
-    Si useful_files est fourni, seuls ces fichiers (ex: ['main.py', 'utils.py']) seront déplacés.
-    Le dossier de staging est ensuite nettoyé. À utiliser par le Manager après validation finale.
+    """Moves files from the staging folder to the workspace.
+    If useful_files is provided, only these files (e.g., ['main.py', 'utils.py']) will be moved.
+    The staging folder is then cleaned. To be used by the Manager after final validation.
     
     Args:
-        useful_files (list, optional): Liste des noms de fichiers ou dossiers à conserver pour l'utilisateur.
+        useful_files (list, optional): List of file or folder names to keep for the user.
     """
     try:
         moved_files = []
@@ -65,11 +65,11 @@ def publish_to_workspace(useful_files: list = None) -> str:
             s = STAGING_DIR / item
             d = WORKSPACE_DIR / item
             
-            # On ignore toujours les fichiers techniques Docker
+            # Always ignore Docker technical files
             if item in ["Dockerfile", "docker-compose.yml"]:
                 continue
                 
-            # Si on a spécifié useful_files, on ignore ce qui n'est pas dedans
+            # If useful_files is specified, ignore what is not in it
             if useful_files is not None and item not in useful_files:
                 continue
                 
@@ -81,7 +81,7 @@ def publish_to_workspace(useful_files: list = None) -> str:
             shutil.move(str(s), str(WORKSPACE_DIR))
             moved_files.append(item)
             
-        # Nettoyer complètement le staging
+        # Completely clean staging
         for item in os.listdir(STAGING_DIR):
             item_path = STAGING_DIR / item
             if os.path.isdir(item_path):
@@ -89,6 +89,6 @@ def publish_to_workspace(useful_files: list = None) -> str:
             else:
                 os.remove(item_path)
                 
-        return f"Succès: {len(moved_files)} fichiers vraiment utiles ({', '.join(moved_files)}) ont été publiés dans le workspace. Staging nettoyé."
+        return f"Success: {len(moved_files)} truly useful files ({', '.join(moved_files)}) were published to the workspace. Staging cleaned."
     except Exception as e:
-        return f"Erreur lors de la publication vers le workspace : {e}"
+        return f"Error publishing to workspace: {e}"

@@ -5,7 +5,7 @@ import csv
 import shutil
 from pathlib import Path
 
-# Ajouter le répertoire parent au sys.path
+# Add parent directory to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.file_tools import clear_workspace
@@ -20,15 +20,15 @@ def generate_prompt(base_prompt: str, size: str) -> str:
     if size == "Small":
         return base_prompt
     elif size == "Medium":
-        padding = LOREM_IPSUM * 5 # ~350 mots
-        return f"{base_prompt}\n\nContexte supplémentaire sans importance, merci de l'ignorer totalement :\n{padding}"
+        padding = LOREM_IPSUM * 5 # ~350 words
+        return f"{base_prompt}\n\nAdditional unimportant context, please ignore completely:\n{padding}"
     elif size == "Large":
-        padding = LOREM_IPSUM * 25 # ~1750 mots
-        return f"{base_prompt}\n\nContexte supplémentaire très long et sans importance, merci de l'ignorer totalement :\n{padding}"
+        padding = LOREM_IPSUM * 25 # ~1750 words
+        return f"{base_prompt}\n\nVery long and unimportant additional context, please ignore completely:\n{padding}"
     return base_prompt
 
 def evaluate_accuracy(agent_name: str, response: str) -> bool:
-    """Évalue si l'agent a réussi sa tâche (Accuracy = 0 ou 100%)."""
+    """Evaluates if the agent successfully completed its task (Accuracy = 0 or 100%)."""
     if agent_name == "Coder":
         if STAGING_DIR.exists() and any(f.endswith(".py") for f in os.listdir(STAGING_DIR)):
             return True
@@ -39,32 +39,32 @@ def evaluate_accuracy(agent_name: str, response: str) -> bool:
         return False
     elif agent_name == "Tester":
         resp_lower = str(response).lower()
-        if "valid" in resp_lower or "rejet" in resp_lower or "review" in resp_lower or "succès" in resp_lower:
+        if "valid" in resp_lower or "reject" in resp_lower or "review" in resp_lower or "success" in resp_lower:
             return True
         return False
     elif agent_name == "Manager":
         resp_lower = str(response).lower()
-        if "délég" in resp_lower or "coder" in resp_lower or "base de données" in resp_lower:
+        if "deleg" in resp_lower or "coder" in resp_lower or "database" in resp_lower:
             return True
         return False
     return False
 
 def run_agent_benchmark():
-    print("🚀 Lancement du Benchmark de Performance des LLM par Agent 🚀\n")
-    print("Ce test utilise Ollama. Il prendra du temps en fonction de votre GPU/CPU.\n")
+    print("🚀 Starting Agent LLM Performance Benchmark 🚀\n")
+    print("This test uses Ollama. It will take time depending on your GPU/CPU.\n")
     
     tasks = [
-        {"agent": coder_agent, "name": "Coder", "base_prompt": "Écris une fonction Python simple qui additionne deux nombres et sauvegarde-la dans 'math_utils.py' avec ton outil."},
-        {"agent": devops_agent, "name": "DevOps", "base_prompt": "Crée un fichier Dockerfile très simple pour une application Python et sauvegarde-le dans le staging."},
-        {"agent": tester_agent, "name": "Tester", "base_prompt": "Fais un rapport de test fictif indiquant que tout est VALIDÉ sans utiliser d'outils."},
-        {"agent": manager_agent, "name": "Manager", "base_prompt": "Analyse la demande suivante et dis-moi à quel agent tu vas la déléguer : 'Je veux un script de base de données'."}
+        {"agent": coder_agent, "name": "Coder", "base_prompt": "Write a simple Python function that adds two numbers and save it to 'math_utils.py' using your tool."},
+        {"agent": devops_agent, "name": "DevOps", "base_prompt": "Create a very simple Dockerfile for a Python application and save it in staging."},
+        {"agent": tester_agent, "name": "Tester", "base_prompt": "Create a fictitious test report stating that everything is APPROVED without using any tools."},
+        {"agent": manager_agent, "name": "Manager", "base_prompt": "Analyze the following request and tell me which agent you will delegate it to: 'I want a database script'."}
     ]
     
     sizes = ["Small", "Medium", "Large"]
     results = []
     
-    print(f"{'Agent':<10} | {'Taille':<10} | {'Mots (env.)':<12} | {'Temps (s)':<10} | {'Accuracy'}")
-    print("-" * 65)
+    print(f"{'Agent':<10} | {'Size':<10} | {'Words (approx)':<15} | {'Time (s)':<10} | {'Accuracy'}")
+    print("-" * 70)
     
     for task in tasks:
         agent = task["agent"]
@@ -74,14 +74,14 @@ def run_agent_benchmark():
             prompt = generate_prompt(task["base_prompt"], size)
             approx_words = len(prompt.split())
             
-            # Nettoyage avant chaque test
+            # Cleanup before each test
             if STAGING_DIR.exists():
                 shutil.rmtree(STAGING_DIR)
             STAGING_DIR.mkdir()
                 
             start_time = time.time()
             try:
-                # Masquer stdout et stderr pendant l'exécution pour cacher les WARNINGS Agno et les barres de progression
+                # Hide stdout and stderr during execution to hide Agno WARNINGS and progress bars
                 original_stdout = sys.stdout
                 original_stderr = sys.stderr
                 try:
@@ -111,37 +111,37 @@ def run_agent_benchmark():
                 except: pass
                 
             acc_str = "✅ 100%" if success else "❌ 0%"
-            print(f"{agent_name:<10} | {size:<10} | {approx_words:<12} | {duration:<10.2f} | {acc_str}")
+            print(f"{agent_name:<10} | {size:<10} | {approx_words:<15} | {duration:<10.2f} | {acc_str}")
             
             results.append({
                 "Agent": agent_name,
-                "Taille_Prompt": size,
-                "Nombre_Mots": approx_words,
-                "Temps_secondes": round(duration, 2),
+                "Prompt_Size": size,
+                "Word_Count": approx_words,
+                "Time_seconds": round(duration, 2),
                 "Accuracy": 100 if success else 0
             })
             
-    print("-" * 65)
+    print("-" * 70)
     
-    # Calcul des statistiques globales
+    # Calculate global statistics
     total_tests = len(results)
     total_successes = sum(1 for r in results if r["Accuracy"] == 100)
-    avg_duration = sum(r["Temps_secondes"] for r in results) / total_tests if total_tests > 0 else 0
+    avg_duration = sum(r["Time_seconds"] for r in results) / total_tests if total_tests > 0 else 0
     global_accuracy = (total_successes / total_tests) * 100 if total_tests > 0 else 0
     
-    print("\n=== Résumé Global ===")
-    print(f"Tests effectués : {total_tests}")
-    print(f"Temps de réponse moyen : {avg_duration:.2f} s")
-    print(f"Accuracy Globale : {global_accuracy:.1f}% ({total_successes}/{total_tests})")
+    print("\n=== Global Summary ===")
+    print(f"Tests executed: {total_tests}")
+    print(f"Average response time: {avg_duration:.2f} s")
+    print(f"Global Accuracy: {global_accuracy:.1f}% ({total_successes}/{total_tests})")
             
     out_dir = Path(os.path.dirname(os.path.abspath(__file__)))
     csv_path = out_dir / "benchmark_llm_results.csv"
     with open(csv_path, mode='w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=["Agent", "Taille_Prompt", "Nombre_Mots", "Temps_secondes", "Accuracy"])
+        writer = csv.DictWriter(f, fieldnames=["Agent", "Prompt_Size", "Word_Count", "Time_seconds", "Accuracy"])
         writer.writeheader()
         writer.writerows(results)
         
-    print(f"\n📊 Rapport complet exporté dans : {csv_path}")
+    print(f"\n📊 Full report exported to: {csv_path}")
 
 if __name__ == "__main__":
     run_agent_benchmark()

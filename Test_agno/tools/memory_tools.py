@@ -2,23 +2,23 @@ import sys
 import os
 from pathlib import Path
 
-# Ajouter le dossier parent au path pour importer les modèles
+# Add the parent folder to the path to import models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from models.titan_model import TitanExternalMemory
 except ImportError:
-    # Fallback pour un mock si le fichier n'est pas dispo
+    # Fallback to a mock if the file is not available
     class TitanExternalMemory:
         def __init__(self, **kwargs): pass
         def store(self, text: str): return ("Mock stored", None, [])
         def retrieve(self, query: str, k=5, min_score=0.1): return []
 
 def store_fact(fact: str) -> str:
-    """Stocke une information importante dans la mémoire à long terme Titan.
+    """Stores important information in the Titan long-term memory.
     
     Args:
-        fact (str): L'information ou le fait à mémoriser (ex: 'Le port de l'API est 8080').
+        fact (str): The information or fact to memorize (e.g., 'The API port is 8080').
     """
     try:
         memory_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "titan_db"
@@ -28,15 +28,15 @@ def store_fact(fact: str) -> str:
         titan.load()
         result_msg, _, _ = titan.store(fact)
         titan.save()
-        return f"Succès: {result_msg}"
+        return f"Success: {result_msg}"
     except Exception as e:
-        return f"Erreur lors de la sauvegarde dans Titan: {e}"
+        return f"Error saving to Titan: {e}"
 
 def retrieve_fact(query: str) -> str:
-    """Recherche une information dans la mémoire à long terme Titan.
+    """Retrieves information from the Titan long-term memory.
     
     Args:
-        query (str): La question ou le mot clé à rechercher.
+        query (str): The question or keyword to search for.
     """
     try:
         memory_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "titan_db"
@@ -45,12 +45,12 @@ def retrieve_fact(query: str) -> str:
         titan.load()
         results = titan.retrieve(query, k=5, min_score=0.1)
         if not results:
-            return "Aucune information trouvée en mémoire."
+            return "No information found in memory."
         
-        # Format les résultats
-        output = "Résultats trouvés en mémoire Titan :\n"
+        # Format the results
+        output = "Results found in Titan memory:\n"
         for score, breakdown, item in results:
-            output += f"- {item.text} (pertinence: {score:.2f})\n"
+            output += f"- {item.text} (relevance: {score:.2f})\n"
         return output
     except Exception as e:
-        return f"Erreur lors de la lecture de Titan: {e}"
+        return f"Error reading from Titan: {e}"

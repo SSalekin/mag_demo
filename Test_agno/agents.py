@@ -4,7 +4,7 @@ from pathlib import Path
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 
-# Configuration des logs
+# Log configuration
 LOG_DIR = Path(os.path.dirname(os.path.abspath(__file__))) / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -20,125 +20,125 @@ from tools.docker_tools import create_dockerfile, create_docker_compose, run_tes
 from tools.file_tools import write_code_to_staging, list_staging_files, publish_to_workspace, clear_workspace
 
 # Coder Agent
-# Rôle : Écrire le code source et les tests unitaires associés dans le staging.
+# Role: Write source code and associated unit tests in staging.
 coder_agent = Agent(
     name="Coder",
-    role="Ingénieur Logiciel Expert",
+    role="Expert Software Engineer",
     model=Ollama(id="qwen2.5:3b"),
     tools=[write_code_to_staging, list_staging_files],
     instructions=[
-        "Tu es un développeur expert.",
-        "Tu reçois des spécifications techniques et tu dois générer du code propre et bien commenté.",
-        "Tu dois TOUJOURS utiliser l'outil 'write_code_to_staging' pour sauvegarder tes fichiers (ex: main.py, test_main.py, requirements.txt).",
-        "Assure-toi de toujours créer au moins un fichier de test pour valider ton code.",
-        "IMPORTANT: Ton fichier principal doit toujours contenir un bloc `if __name__ == '__main__':` avec un exemple d'exécution qui affiche un résultat visible avec `print()`, pour que l'utilisateur puisse le tester facilement.",
-        "IMPORTANT: Tu dois TOUJOURS générer un fichier `README.md` explicatif dans le staging, qui détaille à quoi sert le code généré, comment installer les dépendances (si nécessaire) et la commande exacte pour lancer le script."
+        "You are an expert developer.",
+        "You receive technical specifications and you must generate clean and well-commented code.",
+        "You must ALWAYS use the 'write_code_to_staging' tool to save your files (e.g., main.py, test_main.py, requirements.txt).",
+        "Make sure to always create at least one test file to validate your code.",
+        "IMPORTANT: Your main file must always contain an `if __name__ == '__main__':` block with an execution example that prints a visible result using `print()`, so the user can easily test it.",
+        "IMPORTANT: You must ALWAYS generate an explanatory `README.md` file in the staging directory, detailing what the generated code does, how to install dependencies (if needed), and the exact command to run the script."
     ],
     markdown=True,
 )
 
 # DevOps Agent
-# Rôle : Configurer l'environnement Docker pour tester le code généré.
+# Role: Configure the Docker environment to test the generated code.
 devops_agent = Agent(
     name="DevOps",
-    role="Ingénieur DevOps Expert",
+    role="Expert DevOps Engineer",
     model=Ollama(id="qwen2.5:3b"),
     tools=[create_dockerfile, create_docker_compose, list_staging_files],
     instructions=[
-        "Tu es un ingénieur DevOps. Ton but est de conteneuriser l'application présente dans le 'staging'.",
-        "Analyse les fichiers existants via 'list_staging_files' (ex: y a-t-il un requirements.txt ?).",
-        "Utilise l'outil 'create_dockerfile' pour créer un Dockerfile adapté.",
-        "Utilise l'outil 'create_docker_compose' pour créer un docker-compose.yml qui lance les tests.",
-        "Le conteneur de test doit lancer les tests (ex: pytest) et s'arrêter. N'utilise pas d'applications tournant à l'infini (pas d'API serveur qui ne s'arrête pas) car cela bloquerait les tests."
+        "You are a DevOps engineer. Your goal is to containerize the application located in the 'staging' directory.",
+        "Analyze existing files using 'list_staging_files' (e.g., is there a requirements.txt?).",
+        "Use the 'create_dockerfile' tool to create an appropriate Dockerfile.",
+        "Use the 'create_docker_compose' tool to create a docker-compose.yml that runs the tests.",
+        "The test container must run the tests (e.g., pytest) and then exit. Do not use applications that run indefinitely (no continuous server API) because that would block the tests."
     ],
     markdown=True,
 )
 
 # Tester Agent
-# Rôle : Exécuter l'environnement Docker, faire les benchmarks et donner une review.
+# Role: Run the Docker environment, perform benchmarks, and provide a review.
 tester_agent = Agent(
     name="Tester",
-    role="Ingénieur QA et Évaluateur",
+    role="QA Engineer and Evaluator",
     model=Ollama(id="qwen2.5:3b"),
     tools=[run_tests_in_docker],
     instructions=[
-        "Tu es un ingénieur Qualité. Ton but est d'exécuter les tests via Docker et de rédiger une review complète.",
-        "Utilise l'outil 'run_tests_in_docker' pour lancer la suite de tests et récupérer les logs.",
-        "Analyse les logs : le code compile-t-il ? Les tests passent-ils ? Les performances sont-elles acceptables ?",
-        "Fais un rapport détaillé au Manager avec la mention [REVIEW COMPLETE]. Indique clairement si le code est VALIDÉ ou REJETÉ.",
-        "IMPORTANT: Sois extrêmement CONCIS dans ta réponse (moins de 200 mots). Ne recopie JAMAIS le code source ou les longs logs d'erreur, donne juste ton verdict et le résumé de l'erreur s'il y en a une."
+        "You are a Quality Assurance engineer. Your goal is to execute tests via Docker and write a comprehensive review.",
+        "Use the 'run_tests_in_docker' tool to run the test suite and retrieve the logs.",
+        "Analyze the logs: does the code compile? Do the tests pass? Is the performance acceptable?",
+        "Write a detailed report to the Manager with the mention [REVIEW COMPLETE]. Clearly indicate whether the code is APPROVED or REJECTED.",
+        "IMPORTANT: Be extremely CONCISE in your response (under 200 words). NEVER copy the source code or long error logs, just give your verdict and a summary of the error if there is one."
     ],
     markdown=True,
 )
 
 # Manager Agent
-# Rôle : Orchestrer le tout, communiquer avec le user, et gérer la mémoire.
+# Role: Orchestrate everything, communicate with the user, and manage memory.
 def ask_coder(prompt: str) -> str:
-    """Délègue une tâche à l'agent Coder pour écrire du code.
+    """Delegates a task to the Coder agent to write code.
     Args:
-        prompt (str): Les spécifications du code à écrire.
+        prompt (str): The specifications of the code to write.
     """
-    logger.info(f"MANAGER délègue au CODER: {prompt}")
+    logger.info(f"MANAGER delegates to CODER: {prompt}")
     response = coder_agent.run(prompt)
-    logger.info("CODER a terminé sa tâche.")
-    return "Tâche terminée par le Coder. Les fichiers ont été écrits dans le dossier staging."
+    logger.info("CODER finished its task.")
+    return "Task completed by the Coder. The files have been written to the staging folder."
 
 def ask_devops(prompt: str) -> str:
-    """Délègue une tâche à l'agent DevOps pour créer l'environnement Docker.
+    """Delegates a task to the DevOps agent to create the Docker environment.
     Args:
-        prompt (str): Les instructions pour le DevOps (ex: 'Crée un Dockerfile pour le code dans staging').
+        prompt (str): Instructions for DevOps (e.g., 'Create a Dockerfile for the code in staging').
     """
-    logger.info(f"MANAGER délègue au DEVOPS: {prompt}")
+    logger.info(f"MANAGER delegates to DEVOPS: {prompt}")
     response = devops_agent.run(prompt)
-    logger.info("DEVOPS a terminé sa tâche.")
-    return "Tâche terminée par le DevOps. Les fichiers Docker ont été créés dans staging."
+    logger.info("DEVOPS finished its task.")
+    return "Task completed by DevOps. The Docker files have been created in staging."
 
 def ask_tester(prompt: str) -> str:
-    """Délègue une tâche à l'agent Tester pour exécuter les tests et faire une review.
+    """Delegates a task to the Tester agent to execute tests and perform a review.
     Args:
-        prompt (str): Les instructions pour le Tester (ex: 'Lance les tests et dis-moi si tout est bon').
+        prompt (str): Instructions for Tester (e.g., 'Run the tests and tell me if everything is fine').
     """
-    logger.info(f"MANAGER délègue au TESTER: {prompt}")
+    logger.info(f"MANAGER delegates to TESTER: {prompt}")
     response = tester_agent.run(prompt)
-    logger.info("TESTER a terminé sa tâche.")
+    logger.info("TESTER finished its task.")
     return response.content
 
 def estimate_and_progress(eta_minutes: int, current_step: str, percentage: int) -> str:
-    """Utilise cet outil pour mettre à jour la barre de progression de l'interface utilisateur.
+    """Use this tool to update the progress bar in the user interface.
     Args:
-        eta_minutes (int): Temps estimé en minutes.
-        current_step (str): L'étape en cours (ex: 'PLANIFICATION', 'DEV', 'DOCKER', 'TEST', 'EVALUATION').
-        percentage (int): Pourcentage d'avancement (0 à 100).
+        eta_minutes (int): Estimated time in minutes.
+        current_step (str): The current step (e.g., 'PLANNING', 'DEV', 'DOCKER', 'TEST', 'EVALUATION').
+        percentage (int): Progress percentage (0 to 100).
     """
     bar_length = 25
     filled = int(bar_length * percentage // 100)
     bar = '=' * filled + '-' * (bar_length - filled)
     
-    msg = f"[{bar}] {percentage:>3}% | ETA: {eta_minutes} min | ETAPE: {current_step}"
+    msg = f"[{bar}] {percentage:>3}% | ETA: {eta_minutes} min | STEP: {current_step}"
     logger.info(msg)
     print(f"\n{msg}\n")
-    return "Progression mise à jour et affichée à l'utilisateur."
+    return "Progress updated and displayed to the user."
 
 manager_agent = Agent(
     name="Manager",
-    role="Chef de Projet IA et Orchestrateur",
+    role="AI Project Manager and Orchestrator",
     model=Ollama(id="qwen2.5:3b"),
     tools=[store_fact, retrieve_fact, publish_to_workspace, clear_workspace, ask_coder, ask_devops, ask_tester, estimate_and_progress],
     instructions=[
-        "Tu es le chef de l'équipe de développement autonome.",
-        "Voici ton processus de travail obligatoire :",
-        "1. AVANT toute chose, pose la question suivante à l'utilisateur : 'Voulez-vous que je supprime les anciens fichiers du workspace avant de commencer ? (oui/non)'.",
-        "2. ATTENDS la réponse de l'utilisateur. Si 'oui', utilise l'outil 'clear_workspace'.",
-        "3. Appelle 'estimate_and_progress' (percentage=0, current_step='PLANIFICATION') pour donner un ETA.",
-        "4. (Optionnel) Utilise 'retrieve_fact' pour chercher le contexte dans Titan.",
-        "5. Mets à jour la progression (percentage=25, current_step='DEV'). Délègue au Coder via 'ask_coder'.",
-        "6. Mets à jour la progression (percentage=50, current_step='DOCKER'). Délègue au DevOps via 'ask_devops'.",
-        "7. Mets à jour la progression (percentage=75, current_step='TEST'). Délègue au Tester via 'ask_tester'.",
-        "8. Si la review est REJETÉE, mets à jour la progression (percentage=80, current_step='CORRECTION') et boucle vers le Coder.",
-        "9. Si la review est VALIDÉE, mets à jour la progression (percentage=90, current_step='EVALUATION').",
-        "10. Utilise l'outil 'publish_to_workspace' en passant en argument EXACTEMENT la liste des fichiers qui sont vraiment utiles pour l'utilisateur final (ex: le fichier python principal ET le README.md, mais JAMAIS Dockerfile ou docker-compose).",
-        "11. Utilise OBLIGATOIREMENT 'store_fact' pour enregistrer un résumé du travail accompli et du code généré dans Titan.",
-        "12. Mets à jour la progression à 100% (current_step='TERMINE'). Présente le résultat à l'utilisateur sans emojis et explique clairement comment exécuter le script localement."
+        "You are the leader of the autonomous development team.",
+        "Here is your mandatory workflow:",
+        "1. BEFORE doing anything else, ask the user the following question: 'Do you want me to clear the old files from the workspace before starting? (yes/no)'.",
+        "2. WAIT for the user's answer. If 'yes', use the 'clear_workspace' tool.",
+        "3. Call 'estimate_and_progress' (percentage=0, current_step='PLANNING') to provide an ETA.",
+        "4. (Optional) Use 'retrieve_fact' to search for context in Titan.",
+        "5. Update the progress (percentage=25, current_step='DEV'). Delegate to Coder via 'ask_coder'.",
+        "6. Update the progress (percentage=50, current_step='DOCKER'). Delegate to DevOps via 'ask_devops'.",
+        "7. Update the progress (percentage=75, current_step='TEST'). Delegate to Tester via 'ask_tester'.",
+        "8. If the review is REJECTED, update the progress (percentage=80, current_step='FIXING') and loop back to the Coder.",
+        "9. If the review is APPROVED, update the progress (percentage=90, current_step='EVALUATION').",
+        "10. Use the 'publish_to_workspace' tool, passing EXACTLY the list of files that are truly useful to the end user as arguments (e.g., the main python file AND the README.md, but NEVER Dockerfile or docker-compose).",
+        "11. You MUST use 'store_fact' to record a summary of the accomplished work and the generated code in Titan.",
+        "12. Update the progress to 100% (current_step='DONE'). Present the result to the user without emojis and clearly explain how to execute the script locally."
     ],
     markdown=True,
     add_history_to_context=True,

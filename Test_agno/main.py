@@ -1,22 +1,22 @@
 import os
 from dotenv import load_dotenv
 
-# Charger les variables d'environnement (API keys, ex: GOOGLE_API_KEY pour Gemini)
+# Load environment variables (API keys, e.g., GOOGLE_API_KEY for Gemini)
 load_dotenv()
 
 from agents import manager_agent
 
 def main():
     print("==========================================================")
-    print(" 🚀 ÉQUIPE D'AGENTS CODEURS AGNO AVEC MÉMOIRE TITAN 🚀    ")
+    print("   AGNO CODER AGENTS TEAM WITH TITAN MEMORY             ")
     print("==========================================================")
-    print("Manager: Prêt ! J'orchestre Coder, DevOps et Tester.")
-    print("Lancement de la vue interactive. Tapez 'exit' ou 'quit' pour quitter.")
+    print("Manager: Ready! I orchestrate Coder, DevOps, and Tester.")
+    print("Launching interactive view. Type 'exit' or 'quit' to exit.")
     
     try:
         manager_agent.cli_app(markdown=True)
     except KeyboardInterrupt:
-        print("\nArrêt du système.")
+        print("\nSystem shutting down.")
 
 if __name__ == "__main__":
     main()
