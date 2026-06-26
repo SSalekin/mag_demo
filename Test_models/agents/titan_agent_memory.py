@@ -123,21 +123,33 @@ class TitanAgentMemory:
         changed = self.memory.deactivate_ids([best.id], reason=f"agent forget query: {query}")
         return [AgentMemoryRecord.from_item(item) for item in changed]
 
-    def consolidate(self, keep_existing_ltm: bool = False) -> Dict[str, Any]:
-        """Consolidate active memories into Titan long-term memory.
+    def consolidate(
+        self,
+        keep_existing_ltm: bool = False,
+        max_items: Optional[int] = None,
+        steps: int = 3,
+        include_inactive: bool = False,
+    ) -> Dict[str, Any]:
+        """Consolidate memories into Titan long-term memory.
 
-        Adapter option:
+        Adapter options:
         - keep_existing_ltm=False rebuilds the LTM from active memories only.
         - keep_existing_ltm=True reinforces the existing LTM without resetting it.
+        - max_items limits the replay batch selected by Titan.
+        - steps controls the LTM replay intensity.
+        - include_inactive=False prevents forgotten facts from being reinforced.
 
         The single-file Titan model uses the inverse parameter name: reset_ltm.
-
-        The current single-file Titan model should expose memory.consolidate().
-        This adapter also provides a safe fallback for older branches where that
-        method is not available yet.
+        These optional arguments keep the old API compatible while allowing the
+        automatic consolidation scheduler to apply a real policy.
         """
         if hasattr(self.memory, "consolidate"):
-            result = self.memory.consolidate(reset_ltm=not keep_existing_ltm)  # type: ignore[attr-defined]
+            result = self.memory.consolidate(
+                max_items=max_items,
+                steps=steps,
+                reset_ltm=not keep_existing_ltm,
+                include_inactive=include_inactive,
+            )  # type: ignore[attr-defined]
             if isinstance(result, dict):
                 return result
             return {"status": "ok", "result": result}

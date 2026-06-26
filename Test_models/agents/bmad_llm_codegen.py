@@ -490,7 +490,7 @@ Hard rules:
 - Tests must use unittest so they run with: python -m unittest test_app.py
 - app.py must expose pure functions that test_app.py can import.
 - app.py must also have a CLI entry point guarded by if __name__ == "__main__".
-- Fix the QA failures. Do not reintroduce the same errors.
+- Fix the QA failures using the provided local and Docker diagnostics. Do not reintroduce the same errors.
 - Do not use markdown fences around the JSON.
 - Do not return a generic describe_project placeholder.
 
@@ -502,7 +502,7 @@ Original user request:
 Functional goal:
 {getattr(spec, "goal", "")}
 
-QA failures to fix:
+QA failures and diagnostics to fix:
 {failures}
 
 Current staged files:

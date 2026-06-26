@@ -194,6 +194,34 @@ class QAReport:
     attempt: int = 0
 
 
+
+
+def _qa_repair_messages(qa_report: QAReport, max_chars: int = 5000) -> list[str]:
+    """Build a compact repair context from QA failures, checks and Docker logs.
+
+    Earlier repair cycles only sent the raw failure strings. This helper keeps
+    those failures, but also includes the QA attempt number, successful checks
+    and Docker diagnostics when available. The LLM repair agent can then fix the
+    real cause instead of guessing from a short error fragment.
+    """
+
+    messages: list[str] = [f"QA attempt {qa_report.attempt} failed."]
+    if qa_report.failures:
+        messages.append("Blocking failures:")
+        messages.extend(f"- {failure}" for failure in qa_report.failures)
+    if qa_report.checks:
+        messages.append("Checks that already passed before the failure:")
+        messages.extend(f"- {check}" for check in qa_report.checks[-12:])
+    if qa_report.docker_output:
+        messages.append("Docker diagnostic output:")
+        messages.append(qa_report.docker_output[-max_chars:])
+
+    compact = "\n".join(messages)
+    if len(compact) <= max_chars:
+        return messages
+    return [compact[-max_chars:]]
+
+
 @dataclass(frozen=True)
 class BMADResult:
     """Full result returned by the BMAD coding team."""
@@ -792,12 +820,13 @@ class DevAgent:
             write_file_to_staging("test_app.py", self._build_test(spec))
             artifacts.append(BMADArtifact(path="test_app.py", purpose="Repaired unittest file", producer=self.name))
 
-        failures = "; ".join(qa_report.failures) if qa_report.failures else "unknown QA failure"
+        repair_messages = _qa_repair_messages(qa_report)
+        failures = "; ".join(repair_messages) if repair_messages else "unknown QA failure"
         return BMADStep(
             agent=self.name,
             role=self.role,
-            summary=f"Repair cycle {attempt}: deterministic safe rewrite after QA failure: {failures[:180]}",
-            actions=["inspect_qa_failures", "repair_with_deterministic_template", "rewrite_staging_files"],
+            summary=f"Repair cycle {attempt}: deterministic safe rewrite after QA/Docker diagnostics: {failures[:180]}",
+            actions=["inspect_qa_diagnostics", "repair_with_deterministic_template", "rewrite_staging_files"],
             artifacts=artifacts,
         )
 
@@ -830,7 +859,7 @@ class DevAgent:
         try:
             result = repair(
                 spec=spec,
-                qa_failures=qa_report.failures,
+                qa_failures=_qa_repair_messages(qa_report),
                 current_files=self._read_current_staging_files(),
                 attempt=attempt,
             )
@@ -2188,6 +2217,9 @@ class BMADCodingTeam:
         if qa_report.failures:
             lines.append("QA failures:")
             lines.extend(f"- {failure}" for failure in qa_report.failures)
+            if qa_report.docker_output:
+                lines.append("Docker diagnostics available for repair loop:")
+                lines.append(qa_report.docker_output[-1200:])
         manual_commands = _manual_test_commands(spec, workspace_files)
         if manual_commands:
             lines.append("Manual test commands:")
