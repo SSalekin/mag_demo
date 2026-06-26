@@ -78,7 +78,7 @@ def main() -> int:
 
     memory = FakeMemory()
     assistant = UnifiedChatAssistant(
-        UnifiedChatConfig(use_llm_for_chat=True, use_llm_for_coding=True, use_titan_memory=True),
+        UnifiedChatConfig(use_llm_for_chat=True, use_llm_for_coding=True, use_titan_memory=True, color_enabled=False),
         memory=memory,
         chat_backend=fake_chat_backend,
         bmad_runner=fake_bmad_runner,
@@ -104,6 +104,23 @@ def main() -> int:
 
     exit_response = assistant.process("exit")
     check("Bye" in exit_response and memory.saved, "assistant saves memory on exit", results)
+
+
+    colored_assistant = UnifiedChatAssistant(
+        UnifiedChatConfig(use_llm_for_chat=True, use_llm_for_coding=True, use_titan_memory=True, color_enabled=True),
+        memory=FakeMemory(),
+        chat_backend=fake_chat_backend,
+        bmad_runner=fake_bmad_runner,
+    )
+    check("\033[" in colored_assistant.welcome(), "welcome screen uses ANSI colors when enabled", results)
+    check("\033[" in colored_assistant.process("help"), "help text uses ANSI colors when enabled", results)
+    plain_assistant = UnifiedChatAssistant(
+        UnifiedChatConfig(use_llm_for_chat=True, use_llm_for_coding=True, use_titan_memory=True, color_enabled=False),
+        memory=FakeMemory(),
+        chat_backend=fake_chat_backend,
+        bmad_runner=fake_bmad_runner,
+    )
+    check("\033[" not in plain_assistant.welcome(), "ANSI colors can be disabled", results)
 
     for line in results:
         print(line)

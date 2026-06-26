@@ -32,6 +32,31 @@ from tools.file_tools import clear_staging, clear_workspace, list_staging_files,
 
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 DEFAULT_MEMORY_PATH = os.getenv("TITAN_MEMORY_PATH", str(ROOT.parent / "agent_titan_memory.pt"))
+DEFAULT_COLOR_ENABLED = os.getenv("NO_COLOR", "").strip() == ""
+
+
+class Ansi:
+    """Small ANSI helper used to keep the terminal interface readable without extra dependencies."""
+
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    GRAY = "\033[90m"
+
+
+def color_text(text: str, color: str = "", *, bold: bool = False, enabled: bool = True) -> str:
+    """Return colored text when enabled, otherwise plain text."""
+
+    if not enabled:
+        return text
+    prefix = f"{Ansi.BOLD if bold else ''}{color}"
+    return f"{prefix}{text}{Ansi.RESET}" if prefix else text
 
 
 class ChatMemory(Protocol):
@@ -60,6 +85,7 @@ class UnifiedChatConfig:
     clean_workspace_for_tasks: bool = True
     store_approved_memory: bool = False
     max_revisions: int = 2
+    color_enabled: bool = DEFAULT_COLOR_ENABLED
 
 
 @dataclass(frozen=True)
@@ -241,29 +267,33 @@ class UnifiedChatAssistant:
                 # A missing or incompatible memory file should not prevent chat startup.
                 pass
 
+    def _c(self, text: str, color: str = "", *, bold: bool = False) -> str:
+        return color_text(text, color, bold=bold, enabled=self.config.color_enabled)
+
     def welcome(self) -> str:
         return (
-            "MAG Demo AI Coding Assistant\n"
-            f"LLM model: {self.config.ollama_model}\n"
-            f"Titan memory: {'enabled' if self.config.use_titan_memory else 'disabled'}\n"
-            "Write naturally. Examples:\n"
-            "  Remember that generated apps must include README and tests.\n"
-            "  Create a Python program to solve quadratic equations with README and tests\n"
-            "  What do you remember about project rules?\n"
-            "Type help for commands, exit to quit."
+            self._c("MAG Demo AI Coding Assistant", Ansi.CYAN, bold=True) + "\n"
+            + self._c("LLM model:", Ansi.BLUE, bold=True) + f" {self.config.ollama_model}\n"
+            + self._c("Titan memory:", Ansi.MAGENTA, bold=True) + f" {'enabled' if self.config.use_titan_memory else 'disabled'}\n"
+            + self._c("Docker validation:", Ansi.YELLOW, bold=True) + f" {'enabled' if self.config.run_docker else 'disabled'}\n\n"
+            + self._c("Write naturally. Examples:", Ansi.GREEN, bold=True) + "\n"
+            + "  Remember that generated apps must include README and tests.\n"
+            + "  Create a Python program to solve quadratic equations with README and tests\n"
+            + "  What do you remember about project rules?\n"
+            + self._c("Type help for commands, exit to quit.", Ansi.GRAY)
         )
 
     def help_text(self) -> str:
         return (
-            "Available natural actions:\n"
-            "- Normal chat: ask anything normally.\n"
-            "- Coding: 'Create a Python program ... with README and tests'.\n"
-            "- Memory store: 'Remember that ...' or 'Project rule: ...'.\n"
-            "- Memory recall: 'What do you remember about ...?'.\n"
-            "- Forget: 'Forget ...'.\n"
-            "- Consolidate: 'consolidate memory'.\n\n"
-            "Optional explicit commands still work:\n"
-            "/task, /code, /store, /ask, /forget, /consolidate, /stats, /workspace, /staging, /clear-workspace, /clear-staging, /exit."
+            self._c("Available natural actions:", Ansi.CYAN, bold=True) + "\n"
+            + self._c("- Normal chat:", Ansi.GREEN, bold=True) + " ask anything normally.\n"
+            + self._c("- Coding:", Ansi.GREEN, bold=True) + " 'Create a Python program ... with README and tests'.\n"
+            + self._c("- Memory store:", Ansi.MAGENTA, bold=True) + " 'Remember that ...' or 'Project rule: ...'.\n"
+            + self._c("- Memory recall:", Ansi.MAGENTA, bold=True) + " 'What do you remember about ...?'.\n"
+            + self._c("- Forget:", Ansi.YELLOW, bold=True) + " 'Forget ...'.\n"
+            + self._c("- Consolidate:", Ansi.BLUE, bold=True) + " 'consolidate memory'.\n\n"
+            + self._c("Optional explicit commands still work:", Ansi.GRAY, bold=True) + "\n"
+            + "/task, /code, /store, /ask, /forget, /consolidate, /stats, /workspace, /staging, /clear-workspace, /clear-staging, /exit."
         )
 
     def process(self, message: str) -> str:
@@ -273,15 +303,15 @@ class UnifiedChatAssistant:
             return ""
         if kind == "exit":
             self._safe_save()
-            return "Bye. Titan memory saved."
+            return self._c("Bye. Titan memory saved.", Ansi.GREEN, bold=True)
         if kind == "help":
             return self.help_text()
         if kind == "stats":
             return self._format_stats()
         if kind == "workspace":
-            return "Workspace files:\n" + self._format_file_list(list_workspace_files())
+            return self._c("Workspace files:", Ansi.CYAN, bold=True) + "\n" + self._format_file_list(list_workspace_files())
         if kind == "staging":
-            return "Staging files:\n" + self._format_file_list(list_staging_files())
+            return self._c("Staging files:", Ansi.CYAN, bold=True) + "\n" + self._format_file_list(list_staging_files())
         if kind == "clear_workspace":
             return clear_workspace()
         if kind == "clear_staging":
@@ -306,22 +336,22 @@ class UnifiedChatAssistant:
 
     def _store(self, text: str) -> str:
         if not self.config.use_titan_memory:
-            return "Titan memory is disabled."
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         records = self.memory.store(text, metadata={"source": "unified_chat"})
         self._safe_save()
         if not records:
-            return "Nothing was stored."
-        lines = ["Saved in Titan memory:"]
+            return self._c("Nothing was stored.", Ansi.YELLOW, bold=True)
+        lines = [self._c("Saved in Titan memory:", Ansi.GREEN, bold=True)]
         lines.extend(f"- #{record.id}: {record.text}" for record in records)
         return "\n".join(lines)
 
     def _recall(self, query: str) -> str:
         if not self.config.use_titan_memory:
-            return "Titan memory is disabled."
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         records = self.memory.recall(query, top_k=self.config.memory_top_k, min_score=self.config.memory_min_score)
         if not records:
-            return "No relevant Titan memory found."
-        lines = ["Relevant Titan memories:"]
+            return self._c("No relevant Titan memory found.", Ansi.YELLOW, bold=True)
+        lines = [self._c("Relevant Titan memories:", Ansi.MAGENTA, bold=True)]
         for record in records:
             subject = f"subject={record.subject}" if record.subject else "subject=?"
             prop = f"property={record.property}" if record.property else "property=?"
@@ -330,19 +360,19 @@ class UnifiedChatAssistant:
 
     def _forget(self, query: str) -> str:
         if not self.config.use_titan_memory:
-            return "Titan memory is disabled."
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         records = self.memory.forget(query)
         self._safe_save()
         if not records:
-            return "No safe matching memory found. Nothing was forgotten."
-        return "Forgotten/deactivated:\n" + "\n".join(f"- #{record.id}: {record.text}" for record in records)
+            return self._c("No safe matching memory found. Nothing was forgotten.", Ansi.YELLOW, bold=True)
+        return self._c("Forgotten/deactivated:", Ansi.YELLOW, bold=True) + "\n" + "\n".join(f"- #{record.id}: {record.text}" for record in records)
 
     def _consolidate(self) -> str:
         if not self.config.use_titan_memory:
-            return "Titan memory is disabled."
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         result = self.memory.consolidate(keep_existing_ltm=False, steps=3, include_inactive=False)
         self._safe_save()
-        lines = ["Titan memory consolidated."]
+        lines = [self._c("Titan memory consolidated.", Ansi.GREEN, bold=True)]
         for key in ("message", "status", "replayed", "selected_items", "loss_before", "loss_after"):
             if key in result:
                 lines.append(f"- {key}: {result[key]}")
@@ -362,7 +392,7 @@ class UnifiedChatAssistant:
             ollama_model=self.config.ollama_model,
             max_revision_cycles=self.config.max_revisions,
         )
-        return getattr(result, "final_message", str(result))
+        return self._colorize_bmad_output(getattr(result, "final_message", str(result)))
 
     def _chat(self, message: str) -> str:
         if not self.config.use_llm_for_chat:
@@ -375,11 +405,44 @@ class UnifiedChatAssistant:
                 context = ""
         return self.chat_backend(message, context)
 
+
+    def _colorize_bmad_output(self, text: str) -> str:
+        """Add readable colors to BMAD summaries without changing their content."""
+
+        if not self.config.color_enabled:
+            return text
+        colored: list[str] = []
+        for line in text.splitlines():
+            lower = line.lower()
+            if "bmad coding workflow result: approved" in lower:
+                colored.append(self._c(line, Ansi.GREEN, bold=True))
+            elif "bmad coding workflow result: rejected" in lower or "failed" in lower:
+                colored.append(self._c(line, Ansi.RED, bold=True))
+            elif line.startswith("Task:") or line.startswith("Published:") or line.startswith("Workspace files:"):
+                colored.append(self._c(line, Ansi.CYAN, bold=True))
+            elif line.startswith("QA checks:") or line.startswith("Manual test commands:"):
+                colored.append(self._c(line, Ansi.YELLOW, bold=True))
+            elif line.startswith("Memory candidate") or line.startswith("Memory validation"):
+                colored.append(self._c(line, Ansi.MAGENTA, bold=True))
+            elif line.startswith("- ") and "passed" in lower:
+                colored.append(self._c(line, Ansi.GREEN))
+            elif line.startswith("- ") and ("failed" in lower or "error" in lower):
+                colored.append(self._c(line, Ansi.RED))
+            else:
+                colored.append(line)
+        return "\n".join(colored)
+
+    def user_prompt(self) -> str:
+        return self._c("You>", Ansi.CYAN, bold=True) + " "
+
+    def ai_prefix(self) -> str:
+        return self._c("AI>", Ansi.GREEN, bold=True) + " "
+
     def _format_stats(self) -> str:
         if not self.config.use_titan_memory:
-            return "Titan memory is disabled."
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         stats = self.memory.stats()
-        return "Titan memory stats:\n" + "\n".join(f"- {key}: {value}" for key, value in sorted(stats.items()))
+        return self._c("Titan memory stats:", Ansi.CYAN, bold=True) + "\n" + "\n".join(f"- {key}: {value}" for key, value in sorted(stats.items()))
 
     @staticmethod
     def _format_file_list(result: Any) -> str:
@@ -405,6 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep-workspace", action="store_true", help="Do not clear workspace before each BMAD coding task.")
     parser.add_argument("--store-approved-memory", action="store_true", help="Allow approved BMAD task summaries to be stored in Titan memory.")
     parser.add_argument("--max-revisions", type=int, default=2, help="Maximum BMAD auto-repair cycles.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors in the terminal interface.")
     return parser
 
 
@@ -421,6 +485,7 @@ def config_from_args(args: argparse.Namespace) -> UnifiedChatConfig:
         clean_workspace_for_tasks=not args.keep_workspace,
         store_approved_memory=bool(args.store_approved_memory),
         max_revisions=int(args.max_revisions),
+        color_enabled=not bool(args.no_color),
     )
 
 
@@ -429,7 +494,7 @@ def run_interactive_chat(config: UnifiedChatConfig) -> int:
     print(assistant.welcome())
     while True:
         try:
-            message = input("\nYou> ").strip()
+            message = input("\n" + assistant.user_prompt()).strip()
         except (KeyboardInterrupt, EOFError):
             print("\n" + assistant.process("exit"))
             return 0
@@ -438,7 +503,7 @@ def run_interactive_chat(config: UnifiedChatConfig) -> int:
         action = route_message(message)
         response = assistant.process(message)
         if response:
-            print("\nAI> " + response)
+            print("\n" + assistant.ai_prefix() + response)
         if action.kind == "exit":
             return 0
 
