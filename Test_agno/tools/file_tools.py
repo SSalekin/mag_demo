@@ -5,7 +5,7 @@ from pathlib import Path
 STAGING_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "staging"
 WORKSPACE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "workspace"
 
-def write_code_to_staging(filename: str, content: str) -> str:
+def write_code_to_staging(filename: str, content: str, **kwargs) -> str:
     """Writes a code file to the staging folder (temporary working memory).
     The Coder Agent uses this tool to create source and test files.
     
@@ -19,6 +19,16 @@ def write_code_to_staging(filename: str, content: str) -> str:
         if content.startswith("```"):
             content = re.sub(r"^```[a-zA-Z]*\n", "", content)
             content = re.sub(r"\n```$", "", content)
+            
+        # Clean up stubborn 3B model artifacts
+        content = content.replace("\\n", "\n")
+        content = re.sub(r"^---[\s\S]*?---\n+", "", content) # Strip frontmatter
+        if filename.endswith(".css"):
+            content = re.sub(r"^<style.*?>\n?", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"\n?</style>$", "", content, flags=re.IGNORECASE)
+        elif filename.endswith(".js"):
+            content = re.sub(r"^<script.*?>\n?", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"\n?</script>$", "", content, flags=re.IGNORECASE)
             
         file_path = STAGING_DIR / filename
         # Ensure subdirectories exist if filename contains a path
@@ -44,7 +54,7 @@ def write_code_to_staging(filename: str, content: str) -> str:
     except Exception as e:
         return f"Error writing to staging: {e}"
 
-def list_staging_files() -> str:
+def list_staging_files(**kwargs) -> str:
     """Lists all files present in the staging folder."""
     try:
         files = []
@@ -57,7 +67,7 @@ def list_staging_files() -> str:
     except Exception as e:
         return f"Error listing staging folder: {e}"
 
-def clear_workspace() -> str:
+def clear_workspace(**kwargs) -> str:
     """Deletes all files present in the workspace folder.
     To be used if the user has given their permission to clean the folder.
     """
@@ -72,7 +82,7 @@ def clear_workspace() -> str:
     except Exception as e:
         return f"Error cleaning workspace: {e}"
 
-def clear_staging() -> str:
+def clear_staging(**kwargs) -> str:
     """Deletes all files present in the staging folder to start fresh."""
     try:
         for item in os.listdir(STAGING_DIR):
@@ -85,7 +95,7 @@ def clear_staging() -> str:
     except Exception as e:
         return f"Error cleaning staging: {e}"
 
-def publish_to_workspace(useful_files: list = None) -> str:
+def publish_to_workspace(useful_files: list = None, **kwargs) -> str:
     """Moves files from the staging folder to the workspace.
     If useful_files is provided, only these files (e.g., ['main.py', 'utils.py']) will be moved.
     If not provided, it automatically filters out test files and Docker files, keeping only the strict minimum.

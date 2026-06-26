@@ -1,5 +1,7 @@
 import os
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.panel import Panel
 
 # Load environment variables (API keys, e.g., GOOGLE_API_KEY for Gemini)
 load_dotenv()
@@ -9,29 +11,58 @@ from agents import manager_agent
 from tools.file_tools import WORKSPACE_DIR, clear_workspace, clear_staging
 
 def main():
-    print("==========================================================")
-    print("   AGNO CODER AGENTS TEAM WITH TITAN MEMORY             ")
-    print("==========================================================")
+    console = Console()
+    console.print()
+    console.print(Panel(
+        "[bold cyan]AGNO CODER AGENTS TEAM WITH TITAN MEMORY[/bold cyan]", 
+        title="[bold]SYSTEM START[/bold]", 
+        border_style="dim", 
+        expand=False
+    ))
+    console.print()
     
     # Always wipe staging clean on launch
     clear_staging()
     
     # Verify if workspace is empty
     if WORKSPACE_DIR.exists() and any(WORKSPACE_DIR.iterdir()):
-        user_input = input("⚠️ The 'workspace' folder is not empty. Do you want to clear it before starting? (y/n): ").strip().lower()
-        if user_input in ['y', 'yes']:
+        from rich.prompt import Confirm
+        console.print()
+        if Confirm.ask("[bold yellow]⚠️ The 'workspace' folder is not empty. Do you want to clear it before starting?[/bold yellow]"):
             clear_workspace()
-            print("Workspace cleared successfully.\n")
+            console.print("[bold green]Workspace cleared successfully.[/bold green]\n")
         else:
-            print("Keeping old files in the workspace.\n")
+            console.print("[dim]Keeping old files in the workspace.[/dim]\n")
 
-    print("Manager: Ready! I orchestrate Coder, DevOps, and Tester.")
-    print("Launching interactive view. Type 'exit' or 'quit' to exit.")
+    from rich.prompt import Prompt
+    from rich.markdown import Markdown
     
-    try:
-        manager_agent.cli_app(markdown=True, emoji="")
-    except KeyboardInterrupt:
-        print("\nSystem shutting down.")
+    console.print(Panel(
+        "[bold green]Manager:[/bold green] Ready! I orchestrate Coder, DevOps, and Tester.\nType 'exit' or 'quit' to exit.",
+        border_style="green"
+    ))
+    
+    while True:
+        try:
+            user_input = Prompt.ask("\n[bold cyan]User[/bold cyan]")
+            if user_input.lower() in ['exit', 'quit']:
+                console.print("\n[bold yellow]System shutting down.[/bold yellow]")
+                break
+            if not user_input.strip():
+                continue
+                
+            response = manager_agent.run(user_input)
+            
+            console.print()
+            console.print(Panel(
+                Markdown(response.content),
+                title="[bold green]Manager[/bold green]",
+                border_style="green"
+            ))
+            
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]System shutting down.[/bold yellow]")
+            break
 
 if __name__ == "__main__":
     main()
