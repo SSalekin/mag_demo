@@ -32,6 +32,10 @@ and the deterministic fallback includes a quadratic-equation solver template.
 Step 9 adds runtime behavior validation and a stricter publish filter: QA can
 execute generated CLIs with expected outputs, while workspace/ receives only
 important user-facing files instead of validation-only artifacts.
+
+Step 11 improves Docker/sandbox execution: when requested, QA builds a staging
+Docker image, runs generated unit tests and behavior checks inside the container,
+and falls back cleanly to local validation when Docker is unavailable.
 """
 
 from __future__ import annotations
@@ -51,7 +55,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.docker_tools import create_docker_compose, create_dockerfile, run_tests_in_docker
+from tools.docker_tools import create_docker_compose, create_dockerfile, run_commands_in_docker
 from agents.bmad_llm_codegen import AgnoOllamaCodeGenerator, CodeGenerationResult, GeneratedCodeFile, LLMCodeGenerator
 from agents.bmad_templates import build_app_template, build_test_template
 from tools.file_tools import (
@@ -1496,22 +1500,25 @@ class DevOpsAgent:
         dockerfile = """FROM python:3.11-slim
 WORKDIR /app
 COPY . /app
-CMD ["python", "app.py"]
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
+CMD ["python", "-m", "unittest", "test_app.py"]
 """
         compose = """services:
   app:
     build: .
+    working_dir: /app
+    command: ["python", "-m", "unittest", "test_app.py"]
 """
         create_dockerfile(dockerfile)
         create_docker_compose(compose)
         return BMADStep(
             agent=self.name,
             role=self.role,
-            summary="Created Dockerfile and docker-compose.yml in staging/.",
-            actions=["create_dockerfile", "create_docker_compose"],
+            summary="Created a Python test Dockerfile and docker-compose.yml in staging/.",
+            actions=["create_dockerfile", "create_docker_compose", "prepare_sandbox_test_command"],
             artifacts=[
-                BMADArtifact(path="Dockerfile", purpose="Container execution recipe", producer=self.name),
-                BMADArtifact(path="docker-compose.yml", purpose="Compose service definition", producer=self.name),
+                BMADArtifact(path="Dockerfile", purpose="Containerized Python test environment", producer=self.name),
+                BMADArtifact(path="docker-compose.yml", purpose="Compose test service definition", producer=self.name),
             ],
         )
 
@@ -1627,10 +1634,83 @@ class QAAgent:
 
         docker_output: str | None = None
         if run_docker:
-            docker_output = run_tests_in_docker()
-            checks.append("Docker execution attempted.")
-            if not docker_output.startswith("Return code: 0"):
-                failures.append("Docker execution did not return code 0.")
+            docker_commands: list[tuple[str, list[str]]] = []
+            docker_expectations: dict[str, tuple[int, list[str]]] = {}
+
+            if test_path.exists():
+                docker_commands.append(("docker_unit_tests", ["python", "-m", "unittest", "test_app.py"]))
+                docker_expectations["docker_unit_tests"] = (0, [])
+            else:
+                docker_commands.append(("docker_import_app", ["python", "-c", "import app; print('app import ok')"]))
+                docker_expectations["docker_import_app"] = (0, ["app import ok"])
+
+            if spec is not None and spec.behavior_checks:
+                try:
+                    for behavior in spec.behavior_checks:
+                        for setup_dir in behavior.setup_dirs:
+                            (STAGING_DIR / setup_dir).mkdir(parents=True, exist_ok=True)
+                        for relative_path, content in behavior.setup_files.items():
+                            setup_path = STAGING_DIR / relative_path
+                            setup_path.parent.mkdir(parents=True, exist_ok=True)
+                            setup_path.write_text(content, encoding="utf-8")
+                        docker_commands.append((behavior.name, ["python", "app.py", *behavior.args]))
+                        docker_expectations[behavior.name] = (
+                            behavior.expected_returncode,
+                            list(behavior.expected_output_fragments),
+                        )
+
+                    docker_result = run_commands_in_docker(docker_commands)
+                    docker_output = docker_result.to_text()
+                    if docker_result.skipped:
+                        checks.append(f"Docker execution skipped: {docker_result.reason} Local QA fallback already ran.")
+                    elif not docker_result.success:
+                        checks.append("Docker execution attempted in isolated sandbox.")
+                        if docker_result.build_returncode not in (None, 0):
+                            failures.append("Docker image build failed: " + docker_result.reason)
+                        for command_result in docker_result.commands:
+                            expected_code, expected_fragments = docker_expectations.get(command_result.name, (0, []))
+                            combined_output = command_result.output
+                            if command_result.returncode != expected_code:
+                                failures.append(
+                                    f"Docker check '{command_result.name}' returned {command_result.returncode}, "
+                                    f"expected {expected_code}: {combined_output[:500]}"
+                                )
+                                continue
+                            missing = [fragment for fragment in expected_fragments if fragment not in combined_output]
+                            if missing:
+                                failures.append(
+                                    f"Docker check '{command_result.name}' output missing {missing}: {combined_output[:500]}"
+                                )
+                            else:
+                                checks.append(f"Docker check '{command_result.name}' passed.")
+                    else:
+                        checks.append("Docker execution attempted in isolated sandbox.")
+                        checks.append("Docker image build passed.")
+                        for command_result in docker_result.commands:
+                            expected_code, expected_fragments = docker_expectations.get(command_result.name, (0, []))
+                            combined_output = command_result.output
+                            missing = [fragment for fragment in expected_fragments if fragment not in combined_output]
+                            if command_result.returncode == expected_code and not missing:
+                                checks.append(f"Docker check '{command_result.name}' passed.")
+                            else:
+                                failures.append(
+                                    f"Docker check '{command_result.name}' failed: returncode={command_result.returncode}, "
+                                    f"expected={expected_code}, missing={missing}, output={combined_output[:500]}"
+                                )
+                finally:
+                    if spec is not None:
+                        for behavior in spec.behavior_checks:
+                            for cleanup in behavior.cleanup_files:
+                                cleanup_path = STAGING_DIR / cleanup
+                                if cleanup_path.exists() and cleanup_path.is_file():
+                                    cleanup_path.unlink()
+                            for cleanup in behavior.cleanup_paths:
+                                cleanup_path = STAGING_DIR / cleanup
+                                if cleanup_path.exists():
+                                    if cleanup_path.is_dir():
+                                        shutil.rmtree(cleanup_path)
+                                    else:
+                                        cleanup_path.unlink()
         else:
             checks.append("Docker execution skipped for this minimal local test.")
 
