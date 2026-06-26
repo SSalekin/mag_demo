@@ -24,6 +24,14 @@ tools added in step 1, validates them, and publishes accepted output to
 Step 7 adds an automatic repair loop: when QA fails, the Dev Agent receives the
 QA failures, rewrites the staged files, and QA runs again before the Evaluator
 rejects or approves the result.
+
+Step 8 strengthens open-ended code generation: the LLM prompt now explicitly
+forbids placeholder skeletons, LLM output passes a quality gate before staging,
+and the deterministic fallback includes a quadratic-equation solver template.
+
+Step 9 adds runtime behavior validation and a stricter publish filter: QA can
+execute generated CLIs with expected outputs, while workspace/ receives only
+important user-facing files instead of validation-only artifacts.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ import argparse
 import ast
 import json
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -44,6 +53,7 @@ if str(ROOT) not in sys.path:
 
 from tools.docker_tools import create_docker_compose, create_dockerfile, run_tests_in_docker
 from agents.bmad_llm_codegen import AgnoOllamaCodeGenerator, CodeGenerationResult, GeneratedCodeFile, LLMCodeGenerator
+from agents.bmad_templates import build_app_template, build_test_template
 from tools.file_tools import (
     STAGING_DIR,
     WORKSPACE_DIR,
@@ -131,6 +141,26 @@ class BMADStep:
 
 
 @dataclass(frozen=True)
+class BehaviorCheck:
+    """Runtime CLI behavior check executed by QA.
+
+    Unit tests validate Python functions. Behavior checks validate the generated
+    command-line program as a user would run it from a terminal. Optional setup
+    files/directories let QA test CLIs such as CSV readers and file organizers
+    without requiring the user to prepare data manually.
+    """
+
+    name: str
+    args: list[str]
+    expected_returncode: int = 0
+    expected_output_fragments: list[str] = field(default_factory=list)
+    cleanup_files: list[str] = field(default_factory=list)
+    setup_files: dict[str, str] = field(default_factory=dict)
+    setup_dirs: list[str] = field(default_factory=list)
+    cleanup_paths: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     """Small implementation specification produced by the Business Agent."""
 
@@ -144,6 +174,7 @@ class TaskSpec:
     project_kind: str = "generic"
     cli_examples: list[str] = field(default_factory=list)
     test_command: str = "python -m unittest test_app.py"
+    behavior_checks: list[BehaviorCheck] = field(default_factory=list)
     memory_context: str = ""
     memory_context_used: bool = False
 
@@ -211,6 +242,29 @@ def _staging_file_list() -> list[str]:
     )
 
 
+def _manual_test_commands(spec: TaskSpec | None, workspace_files: Sequence[str]) -> list[str]:
+    """Build user-facing manual test commands from Test_models/."""
+
+    if spec is None or "app.py" not in workspace_files:
+        return []
+    commands = [example.replace("python app.py", r"python workspace\app.py", 1) for example in spec.cli_examples]
+    if "test_app.py" in workspace_files:
+        commands.append(r"cd workspace; python -m unittest test_app.py; cd ..")
+    return commands
+
+
+def _select_publishable_files() -> list[str]:
+    """Return only user-facing files that should be copied to workspace/.
+
+    DevOps/sandbox files such as Dockerfile and docker-compose.yml are useful
+    during validation, but they are not part of the minimal published artifact
+    by default. requirements.txt is included only when the generator produced it.
+    """
+
+    allowlist = ["app.py", "README.md", "test_app.py", "requirements.txt"]
+    return [relative for relative in allowlist if (STAGING_DIR / relative).is_file()]
+
+
 def _extract_title(task: str) -> str:
     words = re.findall(r"[A-Za-z0-9]+", task)
     if not words:
@@ -226,69 +280,297 @@ def _safe_python_string(text: str) -> str:
 
 
 def _detect_project_kind(task: str) -> str:
-    """Detect a deterministic implementation template for the no-LLM workflow."""
+    """Detect a deterministic implementation template for the no-LLM workflow.
+
+    This classifier covers frequent prompts offline. For any request outside
+    these patterns, the BMAD should prefer the optional LLM path. The QA gate
+    later prevents unknown specific requests from being approved as a generic
+    describe_project() placeholder.
+    """
 
     lower = task.lower()
+    if any(word in lower for word in ["quadratic", "second degree", "2nd degree", "discriminant", "roots"]):
+        return "quadratic_solver"
     if any(word in lower for word in ["temperature", "celsius", "fahrenheit"]):
         return "temperature_converter"
     if any(word in lower for word in ["todo", "to-do", "task list", "task manager"]):
         return "todo_cli"
+    if any(word in lower for word in ["user memories", "store and retrieve", "stores and retrieves", "memory store", "retrieve memories"]):
+        return "memory_store"
+    if "csv" in lower and any(word in lower for word in ["statistic", "statistics", "mean", "average", "calculate"]):
+        return "csv_statistics"
+    if any(word in lower for word in ["multi-agent", "multi agent", "agents system", "simulate agents"]):
+        return "multi_agent_simulation"
+    if ("email" in lower and "phone" in lower) or any(word in lower for word in ["validate email", "validates email"]):
+        return "email_phone_validator"
+    if any(word in lower for word in ["organizes files", "organize files", "by extension", "folder by extension"]):
+        return "file_organizer"
+    if any(word in lower for word in ["caesar", "cipher", "encrypt", "decrypt"]):
+        return "caesar_cipher"
+    if "chatbot" in lower and "memory" in lower:
+        return "chatbot_with_memory"
+    if any(word in lower for word in ["automatically runs manual", "test runner", "runs manual and unit tests", "run tests for generated"]):
+        return "test_runner"
     if any(word in lower for word in ["password", "strength checker", "security score"]):
         return "password_strength"
     if any(word in lower for word in ["expense", "budget", "spending", "tracker"]):
         return "expense_tracker"
+    if any(word in lower for word in ["calculator", "arithmetic", "add subtract", "multiply", "divide"]):
+        return "calculator_cli"
+    if any(word in lower for word in ["text analyzer", "text analysis", "count words", "word count", "character count"]):
+        return "text_analyzer"
     return "generic"
+
+
+def _request_requires_specific_implementation(task: str) -> bool:
+    """Return true when a placeholder app should never be approved.
+
+    A simple "create a CLI app" prompt can be satisfied by a tiny generic app.
+    A prompt asking to solve, read, validate, organize, encrypt, simulate, etc.
+    needs real behavior or a valid LLM implementation.
+    """
+
+    lower = f" {task.lower()} "
+    strong_verbs = [
+        " solve ", " manage ", " stores ", " store ", " retrieves ", " retrieve ",
+        " read ", " calculate ", " simulates ", " simulate ", " validates ",
+        " validate ", " organizes ", " organize ", " encrypts ", " encrypt ",
+        " decrypts ", " decrypt ", " creates a simple chatbot", " chatbot", " runs manual",
+        " automatically runs", " analyze ", " count ", " convert ", " track ",
+        " download ", " downloads ", " plot ", " plots ", " fetch ", " parse ",
+    ]
+    domain_words = [
+        "quadratic", "todo", "memory", "csv", "multi-agent", "multi agent", "email",
+        "phone", "extension", "folder", "caesar", "cipher", "chatbot", "password",
+        "expense", "calculator", "statistics", "file", "files", "weather", "data", "chart",
+    ]
+    return any(verb in lower for verb in strong_verbs) or any(word in lower for word in domain_words)
+
+
+def _app_looks_like_generic_placeholder(app_code: str) -> bool:
+    lower = app_code.lower()
+    placeholder_markers = [
+        "def describe_project",
+        "return a small structured description",
+        "build a useful generic python cli",
+        "generated by the minimal bmad coding team",
+    ]
+    return any(marker in lower for marker in placeholder_markers)
 
 
 def _kind_label(project_kind: str) -> str:
     labels = {
         "temperature_converter": "temperature converter CLI",
         "todo_cli": "todo-list CLI",
+        "memory_store": "user memory store CLI",
+        "csv_statistics": "CSV statistics CLI",
+        "multi_agent_simulation": "simple multi-agent simulation CLI",
+        "email_phone_validator": "email and phone validator CLI",
+        "file_organizer": "file organizer by extension CLI",
+        "caesar_cipher": "Caesar cipher CLI",
+        "chatbot_with_memory": "chatbot with memory CLI",
+        "test_runner": "generated-code test runner CLI",
         "password_strength": "password strength checker CLI",
         "expense_tracker": "expense tracker CLI",
+        "quadratic_solver": "quadratic equation solver CLI",
+        "calculator_cli": "calculator CLI",
+        "text_analyzer": "text analyzer CLI",
         "generic": "generic Python CLI",
     }
     return labels.get(project_kind, "generic Python CLI")
 
 
 def _kind_requirements(project_kind: str) -> list[str]:
-    if project_kind == "temperature_converter":
-        return [
+    requirements_by_kind = {
+        "temperature_converter": [
             "Implement Celsius to Fahrenheit conversion.",
             "Implement Fahrenheit to Celsius conversion.",
             "Expose CLI flags for both conversion directions.",
-        ]
-    if project_kind == "todo_cli":
-        return [
+        ],
+        "todo_cli": [
             "Implement add, list and clear operations for todo items.",
             "Keep todo persistence in a simple local text file by default.",
             "Expose CLI subcommands for each todo operation.",
-        ]
-    if project_kind == "password_strength":
-        return [
+        ],
+        "memory_store": [
+            "Implement store and retrieve operations for user memories.",
+            "Persist memories in a small local JSON file by default.",
+            "Expose CLI subcommands: store and retrieve.",
+        ],
+        "csv_statistics": [
+            "Read a CSV file with a header row.",
+            "Extract a numeric column and calculate count, min, max and mean.",
+            "Expose CLI arguments for CSV path and optional column name.",
+        ],
+        "multi_agent_simulation": [
+            "Create simple Agent objects with roles.",
+            "Simulate a manager/developer/QA workflow for a task.",
+            "Print a readable multi-agent execution trace.",
+        ],
+        "email_phone_validator": [
+            "Validate email addresses with deterministic rules.",
+            "Validate phone numbers with deterministic rules.",
+            "Expose CLI commands for email and phone validation.",
+        ],
+        "file_organizer": [
+            "Organize files in a folder into subfolders by extension.",
+            "Use safe local filesystem operations only.",
+            "Report how many files were moved per extension.",
+        ],
+        "caesar_cipher": [
+            "Encrypt messages with a Caesar cipher shift.",
+            "Decrypt messages with the same shift.",
+            "Preserve non-letter characters.",
+        ],
+        "chatbot_with_memory": [
+            "Implement a simple deterministic chatbot.",
+            "Support remembering key/value facts during a scripted session.",
+            "Support recalling remembered facts.",
+        ],
+        "test_runner": [
+            "Run unit tests for generated Python code.",
+            "Expose a CLI that accepts a folder path.",
+            "Return the underlying test command exit code.",
+        ],
+        "password_strength": [
             "Analyze password length, lowercase, uppercase, digit and symbol coverage.",
             "Return a score and a human-readable strength label.",
             "Expose a CLI argument for checking one password.",
-        ]
-    if project_kind == "expense_tracker":
-        return [
+        ],
+        "expense_tracker": [
             "Implement expense storage in a small JSON file by default.",
             "Implement add, list and total operations.",
             "Expose CLI subcommands for each expense operation.",
-        ]
-    return ["Expose a simple command-line entry point."]
+        ],
+        "quadratic_solver": [
+            "Implement a function to solve quadratic equations ax^2 + bx + c = 0.",
+            "Handle two real roots, one repeated root, no real roots and invalid a=0 input.",
+            "Expose CLI arguments for coefficients a, b and c.",
+        ],
+        "calculator_cli": [
+            "Implement add, subtract, multiply and divide operations.",
+            "Handle division by zero safely.",
+            "Expose CLI arguments for operation and two numbers.",
+        ],
+        "text_analyzer": [
+            "Count words, characters and lines in text.",
+            "Expose a CLI argument for input text.",
+            "Print a readable statistics report.",
+        ],
+    }
+    return requirements_by_kind.get(project_kind, ["Expose a simple command-line entry point."])
 
 
 def _kind_cli_examples(project_kind: str) -> list[str]:
+    examples_by_kind = {
+        "temperature_converter": ["python app.py --celsius 20", "python app.py --fahrenheit 68"],
+        "todo_cli": ["python app.py add 'Write benchmark'", "python app.py list", "python app.py clear"],
+        "memory_store": ["python app.py store Elwen 'favorite color is violet'", "python app.py retrieve Elwen"],
+        "csv_statistics": ["python app.py sample.csv", "python app.py sample.csv --column score"],
+        "multi_agent_simulation": ["python app.py 'Build a CLI feature'"],
+        "email_phone_validator": ["python app.py email test@example.com", "python app.py phone +33612345678"],
+        "file_organizer": ["python app.py demo_files"],
+        "caesar_cipher": ["python app.py encrypt hello 3", "python app.py decrypt khoor 3"],
+        "chatbot_with_memory": ["python app.py 'remember name is Elwen' 'what is name?'"],
+        "test_runner": ["python app.py ."],
+        "password_strength": ["python app.py 'StrongerPass123!'"],
+        "expense_tracker": ["python app.py add 'Coffee' 2.50", "python app.py list", "python app.py total"],
+        "quadratic_solver": ["python app.py 1 -3 2", "python app.py 1 2 5"],
+        "calculator_cli": ["python app.py add 2 3", "python app.py divide 6 3"],
+        "text_analyzer": ["python app.py 'hello world'"],
+    }
+    return examples_by_kind.get(project_kind, ["python app.py"])
+
+
+def _kind_behavior_checks(project_kind: str) -> list[BehaviorCheck]:
+    """Return runtime checks for generated CLIs."""
+
     if project_kind == "temperature_converter":
-        return ["python app.py --celsius 20", "python app.py --fahrenheit 68"]
-    if project_kind == "todo_cli":
-        return ["python app.py add 'Write benchmark'", "python app.py list", "python app.py clear"]
+        return [
+            BehaviorCheck("celsius_to_fahrenheit_cli", ["--celsius", "20"], expected_output_fragments=["68.00", "F"]),
+            BehaviorCheck("fahrenheit_to_celsius_cli", ["--fahrenheit", "68"], expected_output_fragments=["20.00", "C"]),
+        ]
     if project_kind == "password_strength":
-        return ["python app.py 'StrongerPass123!'"]
+        return [BehaviorCheck("strong_password_cli", ["StrongerPass123!"], expected_output_fragments=["Password strength:", "strong"])]
+    if project_kind == "quadratic_solver":
+        return [
+            BehaviorCheck("quadratic_two_roots_cli", ["1", "-3", "2"], expected_output_fragments=["Two real roots", "1", "2"]),
+            BehaviorCheck("quadratic_repeated_root_cli", ["1", "2", "1"], expected_output_fragments=["One repeated real root", "-1"]),
+            BehaviorCheck("quadratic_no_real_roots_cli", ["1", "2", "5"], expected_output_fragments=["No real roots"]),
+            BehaviorCheck("quadratic_invalid_a_cli", ["0", "2", "1"], expected_returncode=2, expected_output_fragments=["Error:"]),
+        ]
+    if project_kind == "todo_cli":
+        return [
+            BehaviorCheck("todo_clear_cli", ["clear"], expected_output_fragments=["cleared"]),
+            BehaviorCheck("todo_add_cli", ["add", "Write tests"], expected_output_fragments=["Added item"]),
+            BehaviorCheck("todo_list_cli", ["list"], expected_output_fragments=["Write tests"], cleanup_files=["todo.txt"]),
+        ]
     if project_kind == "expense_tracker":
-        return ["python app.py add 'Coffee' 2.50", "python app.py list", "python app.py total"]
-    return ["python app.py"]
+        return [
+            BehaviorCheck("expense_add_cli", ["add", "Coffee", "2.50"], expected_output_fragments=["Added expense"]),
+            BehaviorCheck("expense_total_cli", ["total"], expected_output_fragments=["Total:", "2.50"], cleanup_files=["expenses.json"]),
+        ]
+    if project_kind == "memory_store":
+        return [
+            BehaviorCheck("memory_store_cli", ["store", "Elwen", "favorite color is violet"], expected_output_fragments=["Stored memory"]),
+            BehaviorCheck("memory_retrieve_cli", ["retrieve", "Elwen"], expected_output_fragments=["favorite color is violet"], cleanup_files=["memories.json"]),
+        ]
+    if project_kind == "csv_statistics":
+        return [
+            BehaviorCheck(
+                "csv_statistics_cli",
+                ["qa_sample.csv", "--column", "score"],
+                expected_output_fragments=["count: 3", "min: 10.00", "max: 20.00", "mean: 15.00"],
+                setup_files={"qa_sample.csv": "name,score\nAlice,10\nBob,15\nCharlie,20\n"},
+                cleanup_files=["qa_sample.csv"],
+            )
+        ]
+    if project_kind == "multi_agent_simulation":
+        return [BehaviorCheck("multi_agent_cli", ["Build feature"], expected_output_fragments=["Multi-agent simulation", "Manager", "Developer", "QA"])]
+    if project_kind == "email_phone_validator":
+        return [
+            BehaviorCheck("valid_email_cli", ["email", "test@example.com"], expected_output_fragments=["valid"]),
+            BehaviorCheck("invalid_email_cli", ["email", "wrong-email"], expected_returncode=1, expected_output_fragments=["invalid"]),
+            BehaviorCheck("valid_phone_cli", ["phone", "+33612345678"], expected_output_fragments=["valid"]),
+            BehaviorCheck("invalid_phone_cli", ["phone", "abc123"], expected_returncode=1, expected_output_fragments=["invalid"]),
+        ]
+    if project_kind == "file_organizer":
+        return [
+            BehaviorCheck(
+                "file_organizer_cli",
+                ["qa_demo_files"],
+                expected_output_fragments=["Moved", "txt", "py"],
+                setup_files={"qa_demo_files/a.txt": "a", "qa_demo_files/b.py": "b"},
+                cleanup_paths=["qa_demo_files"],
+            )
+        ]
+    if project_kind == "caesar_cipher":
+        return [
+            BehaviorCheck("caesar_encrypt_cli", ["encrypt", "hello", "3"], expected_output_fragments=["khoor"]),
+            BehaviorCheck("caesar_decrypt_cli", ["decrypt", "khoor", "3"], expected_output_fragments=["hello"]),
+        ]
+    if project_kind == "chatbot_with_memory":
+        return [BehaviorCheck("chatbot_memory_cli", ["remember name is Elwen", "what is name?"], expected_output_fragments=["Remembered", "Elwen"])]
+    if project_kind == "test_runner":
+        return [
+            BehaviorCheck(
+                "test_runner_cli",
+                ["qa_test_project"],
+                expected_output_fragments=["Unit tests passed"],
+                setup_files={
+                    "qa_test_project/test_sample.py": "import unittest\n\nclass TestSample(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1 + 1, 2)\n\nif __name__ == '__main__':\n    unittest.main()\n"
+                },
+                cleanup_paths=["qa_test_project"],
+            )
+        ]
+    if project_kind == "calculator_cli":
+        return [
+            BehaviorCheck("calculator_add_cli", ["add", "2", "3"], expected_output_fragments=["5"]),
+            BehaviorCheck("calculator_divide_cli", ["divide", "6", "3"], expected_output_fragments=["2"]),
+        ]
+    if project_kind == "text_analyzer":
+        return [BehaviorCheck("text_analyzer_cli", ["hello world"], expected_output_fragments=["words: 2", "characters: 11"])]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +664,7 @@ class BusinessAgent:
             "README.md exists in staging.",
             "Generated Python code passes syntax validation.",
             "Generated unit tests pass locally when test_app.py is present.",
+            "Generated CLI behavior checks pass when defined for the selected app type.",
             f"Generated app matches the selected template: {kind_label}.",
             "Evaluator approves before publishing to workspace.",
         ]
@@ -396,6 +679,7 @@ class BusinessAgent:
             acceptance_criteria=acceptance_criteria,
             project_kind=project_kind,
             cli_examples=_kind_cli_examples(project_kind),
+            behavior_checks=_kind_behavior_checks(project_kind),
             memory_context=memory_context.context if memory_context and memory_context.enabled else "",
             memory_context_used=bool(memory_context and memory_context.enabled),
         )
@@ -598,6 +882,9 @@ The BMAD Dev Agent attempted to use the configured LLM provider but could not pr
 """
 
     def _build_app(self, spec: TaskSpec) -> str:
+        extended_template = build_app_template(spec.project_kind, spec)
+        if extended_template is not None:
+            return extended_template
         if spec.project_kind == "temperature_converter":
             return self._build_temperature_app(spec)
         if spec.project_kind == "todo_cli":
@@ -606,6 +893,8 @@ The BMAD Dev Agent attempted to use the configured LLM provider but could not pr
             return self._build_password_app(spec)
         if spec.project_kind == "expense_tracker":
             return self._build_expense_app(spec)
+        if spec.project_kind == "quadratic_solver":
+            return self._build_quadratic_app(spec)
         return self._build_generic_app(spec)
 
     def _build_generic_app(self, spec: TaskSpec) -> str:
@@ -915,6 +1204,84 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 
+    def _build_quadratic_app(self, spec: TaskSpec) -> str:
+        request = _safe_python_string(spec.original_request)
+        return f'''"""Quadratic equation solver CLI generated by the BMAD coding team.
+
+Request: {spec.original_request}
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+
+REQUEST = {request}
+
+
+def discriminant(a: float, b: float, c: float) -> float:
+    """Return the discriminant for ax^2 + bx + c = 0."""
+
+    return (b * b) - (4 * a * c)
+
+
+def solve_quadratic(a: float, b: float, c: float) -> tuple[float, ...]:
+    """Solve ax^2 + bx + c = 0 and return real roots.
+
+    Returns:
+        A tuple with two roots, one repeated root, or an empty tuple when there
+        are no real roots.
+
+    Raises:
+        ValueError: if a is zero, because the equation is not quadratic.
+    """
+
+    if a == 0:
+        raise ValueError("Coefficient a must not be zero for a quadratic equation.")
+    delta = discriminant(a, b, c)
+    if delta < 0:
+        return ()
+    if delta == 0:
+        return (-b / (2 * a),)
+    sqrt_delta = math.sqrt(delta)
+    root1 = (-b - sqrt_delta) / (2 * a)
+    root2 = (-b + sqrt_delta) / (2 * a)
+    return (root1, root2)
+
+
+def format_roots(roots: tuple[float, ...]) -> str:
+    """Format roots for CLI display."""
+
+    if not roots:
+        return "No real roots."
+    if len(roots) == 1:
+        return f"One repeated real root: {{roots[0]:.6g}}"
+    return f"Two real roots: {{roots[0]:.6g}} and {{roots[1]:.6g}}"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Solve a quadratic equation ax^2 + bx + c = 0.")
+    parser.add_argument("a", type=float, help="Coefficient a, must be non-zero.")
+    parser.add_argument("b", type=float, help="Coefficient b.")
+    parser.add_argument("c", type=float, help="Coefficient c.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        roots = solve_quadratic(args.a, args.b, args.c)
+    except ValueError as exc:
+        print(f"Error: {{exc}}")
+        return 2
+    print(format_roots(roots))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
     def _build_readme(self, spec: TaskSpec) -> str:
         requirements = "\n".join(f"- {item}" for item in spec.requirements)
         criteria = "\n".join(f"- {item}" for item in spec.acceptance_criteria)
@@ -967,6 +1334,9 @@ Generated by the minimal BMAD coding team.
 {test_section}"""
 
     def _build_test(self, spec: TaskSpec) -> str:
+        extended_template = build_test_template(spec.project_kind, spec)
+        if extended_template is not None:
+            return extended_template
         if spec.project_kind == "temperature_converter":
             return '''import unittest
 
@@ -1055,6 +1425,34 @@ class TestExpenseTracker(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 '''
+        if spec.project_kind == "quadratic_solver":
+            return '''import unittest
+
+from app import discriminant, format_roots, solve_quadratic
+
+
+class TestQuadraticSolver(unittest.TestCase):
+    def test_two_real_roots(self) -> None:
+        self.assertEqual(solve_quadratic(1, -3, 2), (1.0, 2.0))
+
+    def test_repeated_root(self) -> None:
+        self.assertEqual(solve_quadratic(1, 2, 1), (-1.0,))
+
+    def test_no_real_roots(self) -> None:
+        self.assertEqual(solve_quadratic(1, 2, 5), ())
+
+    def test_invalid_a(self) -> None:
+        with self.assertRaises(ValueError):
+            solve_quadratic(0, 2, 1)
+
+    def test_format_roots(self) -> None:
+        self.assertIn("Two real roots", format_roots((1.0, 2.0)))
+        self.assertEqual(discriminant(1, -3, 2), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
         return f'''import unittest
 
 from app import describe_project
@@ -1122,7 +1520,7 @@ class QAAgent:
     name = "QA"
     role = "validation"
 
-    def validate(self, run_docker: bool = False, attempt: int = 0) -> tuple[QAReport, BMADStep]:
+    def validate(self, spec: TaskSpec | None = None, run_docker: bool = False, attempt: int = 0) -> tuple[QAReport, BMADStep]:
         checks: list[str] = []
         failures: list[str] = []
         required_files = ["app.py", "README.md", "Dockerfile", "docker-compose.yml"]
@@ -1137,8 +1535,14 @@ class QAAgent:
         app_path = STAGING_DIR / "app.py"
         if app_path.exists():
             try:
-                ast.parse(app_path.read_text(encoding="utf-8"))
+                app_code = app_path.read_text(encoding="utf-8")
+                ast.parse(app_code)
                 checks.append("app.py syntax validation passed.")
+                if spec is not None and _app_looks_like_generic_placeholder(app_code):
+                    if spec.project_kind != "generic" or _request_requires_specific_implementation(spec.original_request):
+                        failures.append(
+                            "Generated app.py is a generic placeholder for a request that needs task-specific behavior."
+                        )
             except SyntaxError as exc:
                 failures.append(f"app.py syntax error: {exc}")
 
@@ -1172,6 +1576,55 @@ class QAAgent:
                 except Exception as exc:
                     failures.append(f"Generated unit tests could not be executed locally: {exc}")
 
+        if spec is not None and spec.behavior_checks:
+            for behavior in spec.behavior_checks:
+                completed = None
+                try:
+                    for setup_dir in behavior.setup_dirs:
+                        (STAGING_DIR / setup_dir).mkdir(parents=True, exist_ok=True)
+                    for relative_path, content in behavior.setup_files.items():
+                        setup_path = STAGING_DIR / relative_path
+                        setup_path.parent.mkdir(parents=True, exist_ok=True)
+                        setup_path.write_text(content, encoding="utf-8")
+
+                    completed = subprocess.run(
+                        [sys.executable, "app.py", *behavior.args],
+                        cwd=STAGING_DIR,
+                        text=True,
+                        capture_output=True,
+                        timeout=20,
+                    )
+                    combined_output = (completed.stdout + completed.stderr).strip()
+                    if completed.returncode != behavior.expected_returncode:
+                        failures.append(
+                            f"Behavior check '{behavior.name}' returned {completed.returncode}, "
+                            f"expected {behavior.expected_returncode}: {combined_output[:500]}"
+                        )
+                        continue
+                    missing = [fragment for fragment in behavior.expected_output_fragments if fragment not in combined_output]
+                    if missing:
+                        failures.append(
+                            f"Behavior check '{behavior.name}' output missing {missing}: {combined_output[:500]}"
+                        )
+                    else:
+                        checks.append(f"Behavior check '{behavior.name}' passed.")
+                except Exception as exc:
+                    failures.append(f"Behavior check '{behavior.name}' could not run: {exc}")
+                finally:
+                    for cleanup in behavior.cleanup_files:
+                        cleanup_path = STAGING_DIR / cleanup
+                        if cleanup_path.exists() and cleanup_path.is_file():
+                            cleanup_path.unlink()
+                    for cleanup in behavior.cleanup_paths:
+                        cleanup_path = STAGING_DIR / cleanup
+                        if cleanup_path.exists():
+                            if cleanup_path.is_dir():
+                                shutil.rmtree(cleanup_path)
+                            else:
+                                cleanup_path.unlink()
+        elif spec is not None:
+            checks.append("No runtime behavior checks defined for this app type.")
+
         docker_output: str | None = None
         if run_docker:
             docker_output = run_tests_in_docker()
@@ -1187,7 +1640,7 @@ class QAAgent:
             agent=self.name,
             role=self.role,
             summary=(f"{summary_prefix} passed." if report.passed else f"{summary_prefix} failed."),
-            actions=["check_required_files", "syntax_validate", "run_generated_unit_tests"] + (["run_docker"] if run_docker else ["skip_docker"]),
+            actions=["check_required_files", "syntax_validate", "run_generated_unit_tests", "run_behavior_checks"] + (["run_docker"] if run_docker else ["skip_docker"]),
             status="passed" if report.passed else "failed",
         )
         return report, step
@@ -1345,7 +1798,7 @@ class BMADCodingTeam:
         steps.append(self.designer.review(spec))
         steps.append(self.devops.prepare_environment())
 
-        qa_report, qa_step = self._run_qa(run_docker=run_docker, attempt=0)
+        qa_report, qa_step = self._run_qa(spec=spec, run_docker=run_docker, attempt=0)
         steps.append(qa_step)
 
         revision_attempts = 0
@@ -1354,7 +1807,7 @@ class BMADCodingTeam:
             steps.append(self.dev.repair(spec, qa_report, revision_attempts))
             steps.append(self.designer.review(spec))
             steps.append(self.devops.prepare_environment())
-            qa_report, qa_step = self._run_qa(run_docker=run_docker, attempt=revision_attempts)
+            qa_report, qa_step = self._run_qa(spec=spec, run_docker=run_docker, attempt=revision_attempts)
             steps.append(qa_step)
 
         evaluation_step = self.evaluator.evaluate(spec, qa_report)
@@ -1362,7 +1815,7 @@ class BMADCodingTeam:
 
         approved = evaluation_step.status == "approved"
         if approved:
-            publish_result = publish_to_workspace(useful_files=["app.py", "README.md", "test_app.py"] if (STAGING_DIR / "test_app.py").exists() else ["app.py", "README.md"])
+            publish_result = publish_to_workspace(useful_files=_select_publishable_files())
             published = publish_result.startswith("Success:")
         else:
             publish_result = "Not published because QA/Evaluator rejected the result."
@@ -1417,6 +1870,7 @@ class BMADCodingTeam:
             memory_candidate,
             memory_validation,
             revision_attempts,
+            spec,
         )
 
         return BMADResult(
@@ -1435,20 +1889,25 @@ class BMADCodingTeam:
             revision_attempts=revision_attempts,
         )
 
-    def _run_qa(self, *, run_docker: bool, attempt: int) -> tuple[QAReport, BMADStep]:
+    def _run_qa(self, *, spec: TaskSpec, run_docker: bool, attempt: int) -> tuple[QAReport, BMADStep]:
         """Run QA while staying compatible with simple test doubles.
 
-        Older benchmarks replace ``qa.validate`` with a tiny function that only
-        accepts ``run_docker``. The production QA accepts an ``attempt`` label so
-        retry reports are clearer.
+        Older benchmarks may replace ``qa.validate`` with a tiny function that
+        only accepts ``run_docker``. The production QA accepts ``spec`` and
+        ``attempt`` so it can run app-specific behavior checks and produce clear
+        retry reports.
         """
 
         try:
-            return self.qa.validate(run_docker=run_docker, attempt=attempt)
-        except TypeError as exc:
-            if "attempt" not in str(exc):
-                raise
-            return self.qa.validate(run_docker=run_docker)
+            return self.qa.validate(spec=spec, run_docker=run_docker, attempt=attempt)
+        except TypeError as first_exc:
+            try:
+                return self.qa.validate(run_docker=run_docker, attempt=attempt)
+            except TypeError:
+                try:
+                    return self.qa.validate(run_docker=run_docker)
+                except TypeError:
+                    raise first_exc
 
     def _get_memory(self) -> ReadOnlyMemory:
         """Return the configured read-only memory object, creating Titan lazily."""
@@ -1628,6 +2087,7 @@ class BMADCodingTeam:
         memory_candidate: str | None,
         memory_validation: MemoryValidationDecision,
         revision_attempts: int = 0,
+        spec: TaskSpec | None = None,
     ) -> str:
         status = "APPROVED" if approved else "REJECTED"
         lines = [
@@ -1648,6 +2108,10 @@ class BMADCodingTeam:
         if qa_report.failures:
             lines.append("QA failures:")
             lines.extend(f"- {failure}" for failure in qa_report.failures)
+        manual_commands = _manual_test_commands(spec, workspace_files)
+        if manual_commands:
+            lines.append("Manual test commands:")
+            lines.extend(f"- {command}" for command in manual_commands)
         if memory_candidate:
             lines.append("Memory candidate (not stored automatically):")
             lines.append(memory_candidate)
