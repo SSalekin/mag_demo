@@ -58,7 +58,14 @@ if str(ROOT) not in sys.path:
 from tools.docker_tools import create_docker_compose, create_dockerfile, run_commands_in_docker
 from agents.bmad_llm_codegen import AgnoOllamaCodeGenerator, CodeGenerationResult, GeneratedCodeFile, LLMCodeGenerator
 from agents.bmad_templates import build_app_template, build_test_template
-from tools.project_registry import archive_generated_project, build_project_reuse_context, find_generated_projects
+from tools.project_registry import (
+    archive_generated_project,
+    build_project_reuse_context,
+    find_generated_projects,
+    restore_project_to_staging,
+    select_project_for_reuse,
+)
+from tools.project_memory import build_project_memory_records, store_project_memory_records
 from tools.file_tools import (
     STAGING_DIR,
     WORKSPACE_DIR,
@@ -184,6 +191,9 @@ class TaskSpec:
     memory_context_used: bool = False
     project_reuse_context: str = ""
     reused_project_ids: list[str] = field(default_factory=list)
+    base_project_id: str | None = None
+    base_project_path: str | None = None
+    reuse_mode: str = "none"
 
 
 @dataclass(frozen=True)
@@ -290,6 +300,10 @@ def _manual_test_commands(spec: TaskSpec | None, workspace_files: Sequence[str])
     if spec is None or "app.py" not in workspace_files:
         return []
     commands = [example.replace("python app.py", r"python workspace\app.py", 1) for example in spec.cli_examples]
+    if _request_supports_complex_roots(spec.original_request):
+        complex_command = r"python workspace\app.py 1 2 5 --complex"
+        if complex_command not in commands:
+            commands.insert(0, complex_command)
     if "test_app.py" in workspace_files:
         commands.append(r"cd workspace; python -m unittest test_app.py; cd ..")
     return commands
@@ -363,6 +377,46 @@ def _detect_project_kind(task: str) -> str:
         return "text_analyzer"
     return "generic"
 
+
+
+def _is_project_reuse_request(task: str) -> bool:
+    """Return true when the user likely wants to reuse or modify an archive."""
+
+    lower = f" {task.lower()} "
+    markers = [
+        " existing ", " already ", " previous ", " old ", " reuse ", " based on ",
+        " modify ", " update ", " extend ", " improve ", " change ",
+        " reprends ", " ancien ", " existant ", " réutilise ", " reutilise ",
+        " modifie ", " améliore ", " ameliore ", " ajoute ",
+    ]
+    return any(marker in lower for marker in markers)
+
+
+def _request_supports_complex_roots(task: str) -> bool:
+    """Return true when the task asks a quadratic solver to support complex roots."""
+
+    lower = f" {task.lower()} "
+    complex_markers = ["complex", "complexe", "complexes", "imaginary", "imaginaire"]
+    equation_markers = [
+        "root", "roots", "racine", "racines", "quadratic", "equation",
+        "second degree", "2nd degree", "discriminant", "solver", "solveur",
+    ]
+    return any(marker in lower for marker in complex_markers) and any(marker in lower for marker in equation_markers)
+
+
+def _must_use_deterministic_template(spec: Any) -> bool:
+    """Bypass LLM generation for strict versioning requests.
+
+    A weak local LLM may return the previous real-only quadratic solver even
+    when the user asks to add complex roots. In that case we must not publish a
+    version that lacks ``--complex``. The deterministic complex template is
+    preferred because QA can then verify the exact behavior.
+    """
+
+    return (
+        getattr(spec, "project_kind", "") == "quadratic_solver"
+        and _request_supports_complex_roots(str(getattr(spec, "original_request", "")))
+    )
 
 def _request_requires_specific_implementation(task: str) -> bool:
     """Return true when a placeholder app should never be approved.
@@ -686,6 +740,9 @@ class BusinessAgent:
         memory_text = memory_context.context.lower() if memory_context and memory_context.enabled else ""
         project_kind = _detect_project_kind(task)
         kind_label = _kind_label(project_kind)
+        reuse_candidates = find_generated_projects(task, limit=3) if project_reuse_context else []
+        base_project = reuse_candidates[0] if (_is_project_reuse_request(task) and reuse_candidates) else None
+        reuse_mode = "modify_existing" if base_project else ("context_only" if reuse_candidates else "none")
 
         requirements = [
             "Create a small, readable Python implementation.",
@@ -702,6 +759,10 @@ class BusinessAgent:
             requirements.append("Review retrieved Titan memory context in read-only mode before implementation.")
         if project_reuse_context:
             requirements.append("Review relevant archived generated projects and reuse their validated structure when useful.")
+        if base_project:
+            requirements.append(f"Reuse archived project {base_project.get('project_id')} as the starting point and create a new validated version.")
+        if project_kind == "quadratic_solver" and _request_supports_complex_roots(task):
+            requirements.append("Extend the quadratic solver to support complex roots when requested.")
 
         acceptance_criteria = [
             "app.py exists in staging.",
@@ -716,6 +777,16 @@ class BusinessAgent:
             acceptance_criteria.append("Titan memory context was retrieved in read-only mode and was not modified automatically.")
         if project_reuse_context:
             acceptance_criteria.append("Relevant archived project context was reviewed before implementation.")
+        if base_project:
+            acceptance_criteria.append("A new project archive version references the reused parent project.")
+
+        behavior_checks = _kind_behavior_checks(project_kind)
+        if project_kind == "quadratic_solver" and _request_supports_complex_roots(task):
+            behavior_checks = [
+                BehaviorCheck("quadratic_complex_roots_cli", ["1", "2", "5", "--complex"], expected_output_fragments=["Complex roots", "i"]),
+                BehaviorCheck("quadratic_two_real_roots_cli", ["1", "-3", "2"], expected_output_fragments=["Two real roots", "1", "2"]),
+                BehaviorCheck("quadratic_invalid_a_cli", ["0", "2", "1"], expected_returncode=2, expected_output_fragments=["Error:"]),
+            ]
 
         spec = TaskSpec(
             original_request=task,
@@ -724,13 +795,16 @@ class BusinessAgent:
             requirements=requirements,
             acceptance_criteria=acceptance_criteria,
             project_kind=project_kind,
-            cli_examples=_kind_cli_examples(project_kind),
-            behavior_checks=_kind_behavior_checks(project_kind),
+            cli_examples=_kind_cli_examples(project_kind) + (["python app.py 1 2 5 --complex"] if project_kind == "quadratic_solver" and _request_supports_complex_roots(task) else []),
+            behavior_checks=behavior_checks,
             memory_context=(memory_context.context if memory_context and memory_context.enabled else "")
             + (("\n\n" + project_reuse_context) if project_reuse_context else ""),
             memory_context_used=bool(memory_context and memory_context.enabled or project_reuse_context),
             project_reuse_context=project_reuse_context,
-            reused_project_ids=[str(item.get("project_id")) for item in find_generated_projects(task, limit=3)] if project_reuse_context else [],
+            reused_project_ids=[str(item.get("project_id")) for item in reuse_candidates],
+            base_project_id=str(base_project.get("project_id")) if base_project else None,
+            base_project_path=str(base_project.get("project_path")) if base_project else None,
+            reuse_mode=reuse_mode,
         )
         step = BMADStep(
             agent=self.name,
@@ -741,7 +815,8 @@ class BusinessAgent:
             ),
             actions=["define_goal", "detect_project_template", "define_requirements", "define_acceptance_criteria"]
             + (["consume_read_only_memory_context"] if memory_context and memory_context.enabled else [])
-            + (["consume_archived_project_context"] if project_reuse_context else []),
+            + (["consume_archived_project_context"] if project_reuse_context else [])
+            + (["select_archived_project_for_modification"] if base_project else []),
         )
         return spec, step
 
@@ -762,7 +837,8 @@ class DevAgent:
 
     def implement(self, spec: TaskSpec) -> BMADStep:
         llm_failure_note: str | None = None
-        if self.code_generator is not None:
+        force_deterministic_template = _must_use_deterministic_template(spec)
+        if self.code_generator is not None and not force_deterministic_template:
             llm_step = self._implement_with_llm(spec)
             if llm_step is not None:
                 return llm_step
@@ -798,7 +874,13 @@ class DevAgent:
 
         actions = ["select_code_template", "write_app", "write_readme"] + (["write_tests"] if len(artifacts) > 2 else [])
         summary = f"Generated a {_kind_label(spec.project_kind)} implementation in staging/."
-        if llm_failure_note:
+        if force_deterministic_template:
+            actions = ["force_deterministic_template_for_strict_reuse", *actions]
+            summary = (
+                "Used deterministic versioning template because this request "
+                "requires complex-root support and must not be replaced by an incomplete LLM output."
+            )
+        elif llm_failure_note:
             actions = ["llm_generate_code_failed", "fallback_to_deterministic_template", *actions]
             summary = "LLM generation failed safely; deterministic template fallback was used."
 
@@ -820,7 +902,8 @@ class DevAgent:
         the loop useful with Agno/Ollama while remaining fully testable offline.
         """
 
-        if self.code_generator is not None and hasattr(self.code_generator, "repair"):
+        force_deterministic_template = _must_use_deterministic_template(spec)
+        if self.code_generator is not None and hasattr(self.code_generator, "repair") and not force_deterministic_template:
             llm_step = self._repair_with_llm(spec, qa_report, attempt)
             if llm_step is not None:
                 return llm_step
@@ -1924,6 +2007,24 @@ class BMADCodingTeam:
 
         spec, business_step = self.business.define_spec(task, memory_context=memory_context, project_reuse_context=project_reuse_context)
         steps.append(business_step)
+
+        reused_archive_info: dict[str, Any] | None = None
+        if spec.reuse_mode == "modify_existing" and spec.base_project_id:
+            reused_archive_info = restore_project_to_staging(spec.base_project_id)
+            status = "completed" if reused_archive_info.get("ok") else "failed"
+            steps.append(BMADStep(
+                agent="Project Registry",
+                role="project reuse",
+                summary=(
+                    f"Restored archived project {spec.base_project_id} into staging for modification."
+                    if reused_archive_info.get("ok")
+                    else f"Could not restore archived project {spec.base_project_id}: {reused_archive_info.get('error')}"
+                ),
+                actions=["restore_archived_project_to_staging", "prepare_new_version"],
+                artifacts=[BMADArtifact(path=f"workspace/projects/{spec.base_project_id}", purpose="Parent archived project", producer="Project Registry")],
+                status=status,
+            ))
+
         steps.append(self.dev.implement(spec))
         steps.append(self.designer.review(spec))
         steps.append(self.devops.prepare_environment())
@@ -1967,6 +2068,10 @@ class BMADCodingTeam:
                         "revision_attempts": revision_attempts,
                         "memory_context_records": len(memory_context.records),
                         "reused_project_ids": spec.reused_project_ids,
+                        "base_project_id": spec.base_project_id,
+                        "base_project_path": spec.base_project_path,
+                        "reuse_mode": spec.reuse_mode,
+                        "restored_archive": reused_archive_info,
                     },
                 )
                 project_archive = manifest.to_dict()
@@ -1990,7 +2095,7 @@ class BMADCodingTeam:
             store_approved_memory=self.store_approved_memory,
         )
         if memory_validation.should_store:
-            memory_validation = self._store_validated_memory(memory_validation)
+            memory_validation = self._store_validated_memory(memory_validation, project_archive=project_archive)
 
         # Build a temporary result to let the PM create the final decision step.
         partial_result = BMADResult(
@@ -2090,8 +2195,16 @@ class BMADCodingTeam:
         This does not write to Titan. It gives the Dev Agent and optional LLM a
         stable pointer to previous validated projects so future tasks can reuse
         existing files instead of always starting from zero.
+
+        Important: project archive context is now injected only for explicit
+        reuse/modification requests.  A fresh request like "Create an email
+        validator" must not accidentally reuse an unrelated older project just
+        because both prompts contain generic words such as "program" or
+        "README".
         """
 
+        if not _is_project_reuse_request(task):
+            return ""
         try:
             return build_project_reuse_context(task, limit=3)
         except Exception:
@@ -2208,8 +2321,20 @@ class BMADCodingTeam:
             f"{reuse_text}"
         )
 
-    def _store_validated_memory(self, decision: MemoryValidationDecision) -> MemoryValidationDecision:
-        """Store an approved memory candidate through the controlled write gate."""
+    def _store_validated_memory(
+        self,
+        decision: MemoryValidationDecision,
+        *,
+        project_archive: dict[str, Any] | None = None,
+    ) -> MemoryValidationDecision:
+        """Store approved BMAD memories through the controlled write gate.
+
+        Step 19 makes project memories more useful: when a validated workspace
+        artifact has been archived, Titan receives several compact records
+        pointing to the project id, path, files, functions, tests and lineage.
+        Titan still does not store full source code; code stays in
+        ``workspace/projects`` and memory stores searchable pointers.
+        """
 
         if not decision.should_store or not decision.candidate:
             return decision
@@ -2226,18 +2351,28 @@ class BMADCodingTeam:
                     store_result="failed_missing_store_method",
                     error="Configured memory object does not expose store().",
                 )
-            records = memory.store(
-                decision.candidate,
-                metadata={
-                    "source": "bmad_coding_team",
-                    "validation": "project_manager_evaluator_gate",
-                    "store_policy": "explicit_store_approved_memory",
-                },
-            )
-            try:
-                records_stored = len(records)
-            except TypeError:
-                records_stored = 1
+
+            records_stored = 0
+            project_records = build_project_memory_records(project_archive)
+            if project_records:
+                records_stored += store_project_memory_records(memory, project_records)
+                store_result = "stored_project_archive_records"
+            else:
+                records = memory.store(
+                    decision.candidate,
+                    metadata={
+                        "source": "bmad_coding_team",
+                        "validation": "project_manager_evaluator_gate",
+                        "store_policy": "explicit_store_approved_memory",
+                        "memory_type": "bmad_workflow_summary",
+                    },
+                )
+                try:
+                    records_stored += len(records)
+                except TypeError:
+                    records_stored += 1
+                store_result = "stored_and_saved"
+
             if hasattr(memory, "save"):
                 memory.save()
             return MemoryValidationDecision(
@@ -2247,7 +2382,7 @@ class BMADCodingTeam:
                 reason=decision.reason,
                 approved_by=decision.approved_by,
                 records_stored=records_stored,
-                store_result="stored_and_saved",
+                store_result=store_result,
             )
         except Exception as exc:  # pragma: no cover - defensive path
             return MemoryValidationDecision(

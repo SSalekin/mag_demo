@@ -180,14 +180,34 @@ FORGET_PATTERNS = (
     r"^don't remember\b",
 )
 
+PROJECT_ARCHIVE_RECALL_MARKERS = (
+    "project", "projects", "generated", "archive", "archives", "workspace",
+    "program", "app", "application", "code", "files", "functions",
+    "quadratic", "equation", "solver", "roots", "complex",
+    "email", "phone", "validator", "csv", "statistics", "caesar", "cipher",
+    "todo", "memory", "memories", "organizer", "chatbot", "test runner",
+)
+
+
+def _looks_like_project_archive_query(text: str) -> bool:
+    lower = text.lower()
+    if any(marker in lower for marker in PROJECT_ARCHIVE_RECALL_MARKERS):
+        return True
+    return False
+
 TASK_STARTERS = (
     "create", "build", "write", "generate", "make", "develop", "code", "implement",
-    "can you create", "can you build", "can you write", "please create", "please build", "please write",
+    "modify", "update", "extend", "improve", "change", "add", "adapt", "refactor",
+    "can you create", "can you build", "can you write", "can you modify", "can you update",
+    "please create", "please build", "please write", "please modify", "please update",
+    "reprends", "modifie", "ameliore", "améliore", "ajoute", "etends", "étends",
 )
 
 TASK_MARKERS = (
     "python", "program", "script", "app", "application", "cli", "readme", "test", "tests",
     "docker", "file", "project", "function", "api", "website", "tool",
+    "solver", "solveur", "quadratic", "equation", "roots", "root", "racines", "racine",
+    "complex", "feature", "support", "existing", "archive", "workspace",
 )
 
 
@@ -462,13 +482,43 @@ class UnifiedChatAssistant:
             return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
         records = self.memory.recall(query, top_k=self.config.memory_top_k, min_score=self.config.memory_min_score)
         if not records:
+            project_fallback = self._recall_project_archives(query)
+            if project_fallback:
+                return project_fallback
             return self._c("No relevant Titan memory found.", Ansi.YELLOW, bold=True)
         lines = [self._c("Relevant Titan memories:", Ansi.MAGENTA, bold=True)]
         for record in records:
             subject = f"subject={record.subject}" if record.subject else "subject=?"
             prop = f"property={record.property}" if record.property else "property=?"
             lines.append(f"- #{record.id} score={record.score:.3f} {subject} {prop}: {record.text}")
+
+        # Project archives are the durable source of truth for generated code.
+        # Even when Titan returns some memories, add archive matches for project
+        # questions so the user gets concrete project ids and paths.
+        project_fallback = self._recall_project_archives(query)
+        if project_fallback:
+            lines.append("")
+            lines.append(project_fallback)
         return "\n".join(lines)
+
+    def _recall_project_archives(self, query: str) -> str:
+        """Return project archive search results for project-memory questions.
+
+        Titan stores compact pointers, but the project registry is the stable
+        on-disk index of generated code.  This fallback makes natural questions
+        like "What do you remember about email validator projects?" useful even
+        when neural retrieval is too strict.
+        """
+
+        if not _looks_like_project_archive_query(query):
+            return ""
+        try:
+            results = format_project_search_results(query, limit=5)
+        except Exception:
+            return ""
+        if results.lower().startswith("no generated project archive matched"):
+            return ""
+        return self._c("Generated project archive matches:", Ansi.CYAN, bold=True) + "\n" + results
 
     def _forget(self, query: str) -> str:
         if not self.config.use_titan_memory:
