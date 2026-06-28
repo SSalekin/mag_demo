@@ -27,7 +27,13 @@ if str(ROOT) not in sys.path:
 
 from agents.bmad_coding_team import run_bmad_task  # type: ignore
 from agents.titan_agent_memory import AgentMemoryRecord, TitanAgentMemory  # type: ignore
+from memory.consolidation_scheduler import ConsolidationPolicy, ConsolidationRunResult, ConsolidationScheduler  # type: ignore
 from tools.file_tools import clear_staging, clear_workspace, list_staging_files, list_workspace_files  # type: ignore
+from tools.project_registry import (  # type: ignore
+    format_project_detail,
+    format_project_search_results,
+    list_generated_projects,
+)
 
 
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
@@ -86,6 +92,14 @@ class UnifiedChatConfig:
     store_approved_memory: bool = False
     max_revisions: int = 2
     color_enabled: bool = DEFAULT_COLOR_ENABLED
+    auto_consolidation_enabled: bool = True
+    consolidation_hour: int = int(os.getenv("TITAN_CONSOLIDATION_HOUR", "2"))
+    consolidation_minute: int = int(os.getenv("TITAN_CONSOLIDATION_MINUTE", "0"))
+    consolidation_steps: int = int(os.getenv("TITAN_CONSOLIDATION_STEPS", "3"))
+    consolidation_max_items: int | None = None
+    consolidation_min_hours_between_runs: float = 20.0
+    consolidation_log_dir: str | Path = ROOT / "logs"
+    force_startup_consolidation: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +227,12 @@ def route_message(message: str) -> RoutedAction:
         return RoutedAction("stats", "", "stats keyword")
     if lower in {"workspace", "list workspace", "/workspace"}:
         return RoutedAction("workspace", "", "workspace keyword")
+    if lower in {"projects", "list projects", "generated projects", "project archives", "/projects"}:
+        return RoutedAction("projects", "", "generated projects keyword")
+    if lower.startswith("find project ") or lower.startswith("search project "):
+        return RoutedAction("project_search", text.split(" ", 2)[2].strip(), "project archive search")
+    if lower.startswith("show project ") or lower.startswith("project "):
+        return RoutedAction("project_detail", text.split(" ", 2)[2].strip() if lower.startswith("show project ") else text.split(" ", 1)[1].strip(), "project archive detail")
     if lower in {"staging", "list staging", "/staging"}:
         return RoutedAction("staging", "", "staging keyword")
     if lower in {"clear workspace", "/clear-workspace"}:
@@ -227,6 +247,8 @@ def route_message(message: str) -> RoutedAction:
         return RoutedAction("recall", text.split(" ", 1)[1].strip(), "explicit memory query")
     if lower.startswith("/forget "):
         return RoutedAction("forget", text.split(" ", 1)[1].strip(), "explicit forget command")
+    if lower in {"consolidation status", "nightly consolidation status", "/consolidation-status"}:
+        return RoutedAction("consolidation_status", text, "consolidation status command")
     if lower.startswith("/consolidate") or lower in {"consolidate memory", "consolidate titan memory"}:
         return RoutedAction("consolidate", text, "consolidation command")
 
@@ -260,12 +282,14 @@ class UnifiedChatAssistant:
         )
         self.chat_backend = chat_backend or OllamaChatBackend(self.config.ollama_model)
         self.bmad_runner = bmad_runner
+        self.startup_consolidation_result: ConsolidationRunResult | None = None
         if self.config.use_titan_memory:
             try:
                 self.memory.load(self.config.memory_path)
             except Exception:
                 # A missing or incompatible memory file should not prevent chat startup.
                 pass
+            self.startup_consolidation_result = self._run_startup_consolidation()
 
     def _c(self, text: str, color: str = "", *, bold: bool = False) -> str:
         return color_text(text, color, bold=bold, enabled=self.config.color_enabled)
@@ -275,6 +299,7 @@ class UnifiedChatAssistant:
             self._c("MAG Demo AI Coding Assistant", Ansi.CYAN, bold=True) + "\n"
             + self._c("LLM model:", Ansi.BLUE, bold=True) + f" {self.config.ollama_model}\n"
             + self._c("Titan memory:", Ansi.MAGENTA, bold=True) + f" {'enabled' if self.config.use_titan_memory else 'disabled'}\n"
+            + self._c("Nightly consolidation:", Ansi.BLUE, bold=True) + f" {self._format_startup_consolidation_inline()}\n"
             + self._c("Docker validation:", Ansi.YELLOW, bold=True) + f" {'enabled' if self.config.run_docker else 'disabled'}\n\n"
             + self._c("Write naturally. Examples:", Ansi.GREEN, bold=True) + "\n"
             + "  Remember that generated apps must include README and tests.\n"
@@ -291,9 +316,10 @@ class UnifiedChatAssistant:
             + self._c("- Memory store:", Ansi.MAGENTA, bold=True) + " 'Remember that ...' or 'Project rule: ...'.\n"
             + self._c("- Memory recall:", Ansi.MAGENTA, bold=True) + " 'What do you remember about ...?'.\n"
             + self._c("- Forget:", Ansi.YELLOW, bold=True) + " 'Forget ...'.\n"
-            + self._c("- Consolidate:", Ansi.BLUE, bold=True) + " 'consolidate memory'.\n\n"
+            + self._c("- Consolidate:", Ansi.BLUE, bold=True) + " 'consolidate memory'.\n"
+            + self._c("- Consolidation status:", Ansi.BLUE, bold=True) + " 'consolidation status'.\n\n"
             + self._c("Optional explicit commands still work:", Ansi.GRAY, bold=True) + "\n"
-            + "/task, /code, /store, /ask, /forget, /consolidate, /stats, /workspace, /staging, /clear-workspace, /clear-staging, /exit."
+            + "/task, /code, /store, /ask, /forget, /consolidate, /consolidation-status, /stats, /workspace, /projects, find project ..., project <id>, /staging, /clear-workspace, /clear-staging, /exit."
         )
 
     def process(self, message: str) -> str:
@@ -310,6 +336,12 @@ class UnifiedChatAssistant:
             return self._format_stats()
         if kind == "workspace":
             return self._c("Workspace files:", Ansi.CYAN, bold=True) + "\n" + self._format_file_list(list_workspace_files())
+        if kind == "projects":
+            return self._c("Generated project archives:", Ansi.CYAN, bold=True) + "\n" + list_generated_projects()
+        if kind == "project_search":
+            return self._c("Generated project search:", Ansi.CYAN, bold=True) + "\n" + format_project_search_results(action.payload)
+        if kind == "project_detail":
+            return self._c("Generated project detail:", Ansi.CYAN, bold=True) + "\n" + format_project_detail(action.payload)
         if kind == "staging":
             return self._c("Staging files:", Ansi.CYAN, bold=True) + "\n" + self._format_file_list(list_staging_files())
         if kind == "clear_workspace":
@@ -318,6 +350,8 @@ class UnifiedChatAssistant:
             return clear_staging()
         if kind == "consolidate":
             return self._consolidate()
+        if kind == "consolidation_status":
+            return self._consolidation_status()
         if kind == "store":
             return self._store(action.payload)
         if kind == "recall":
@@ -327,6 +361,84 @@ class UnifiedChatAssistant:
         if kind == "task":
             return self._run_task(action.payload)
         return self._chat(action.payload)
+
+    def _build_consolidation_policy(self) -> ConsolidationPolicy:
+        """Build the startup consolidation policy from chat configuration."""
+
+        log_dir = Path(self.config.consolidation_log_dir)
+        return ConsolidationPolicy(
+            enabled=bool(self.config.auto_consolidation_enabled),
+            schedule_hour=int(self.config.consolidation_hour),
+            schedule_minute=int(self.config.consolidation_minute),
+            min_hours_between_runs=float(self.config.consolidation_min_hours_between_runs),
+            steps=int(self.config.consolidation_steps),
+            max_items=self.config.consolidation_max_items,
+            log_dir=log_dir,
+            state_path=log_dir / "consolidation_state.json",
+            log_path=log_dir / "consolidation_log.jsonl",
+            keep_existing_ltm=True,
+            include_inactive=False,
+            save_after=True,
+        )
+
+    def _run_startup_consolidation(self) -> ConsolidationRunResult | None:
+        """Run the scheduler once at startup without forcing repeated consolidation."""
+
+        if not self.config.use_titan_memory:
+            return None
+        try:
+            policy = self._build_consolidation_policy()
+            scheduler = ConsolidationScheduler(memory=self.memory, policy=policy)
+            if self.config.force_startup_consolidation:
+                return scheduler.run_once(reason="startup_forced", force=True)
+            return scheduler.run_if_due()
+        except Exception as exc:  # pragma: no cover - defensive startup path
+            return ConsolidationRunResult(
+                ran=False,
+                status="error",
+                reason="startup",
+                message="Automatic consolidation check failed during startup.",
+                run_at="startup",
+                policy={},
+                error=str(exc),
+            )
+
+    def _format_startup_consolidation_inline(self) -> str:
+        result = self.startup_consolidation_result
+        if not self.config.use_titan_memory:
+            return "disabled because Titan memory is disabled"
+        if not self.config.auto_consolidation_enabled:
+            return "disabled"
+        if result is None:
+            return "not checked"
+        if result.status == "ok" and result.ran:
+            return "completed"
+        if result.status == "skipped":
+            return f"skipped ({result.reason})"
+        if result.status == "error":
+            return "error"
+        return f"{result.status}; ran={result.ran}"
+
+    def _consolidation_status(self) -> str:
+        result = self.startup_consolidation_result
+        if not self.config.use_titan_memory:
+            return self._c("Titan memory is disabled.", Ansi.YELLOW, bold=True)
+        if not self.config.auto_consolidation_enabled:
+            return self._c("Automatic consolidation is disabled.", Ansi.YELLOW, bold=True)
+        if result is None:
+            return self._c("Automatic consolidation has not been checked yet.", Ansi.YELLOW, bold=True)
+        lines = [self._c("Nightly consolidation status:", Ansi.BLUE, bold=True)]
+        lines.append(f"- status: {result.status}")
+        lines.append(f"- ran: {result.ran}")
+        lines.append(f"- reason: {result.reason}")
+        lines.append(f"- message: {result.message}")
+        if result.log_path:
+            lines.append(f"- log_path: {result.log_path}")
+        if result.state_path:
+            lines.append(f"- state_path: {result.state_path}")
+        if result.error:
+            lines.append(f"- error: {result.error}")
+        return "\n".join(lines)
 
     def _safe_save(self) -> None:
         try:
@@ -469,6 +581,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--store-approved-memory", action="store_true", help="Allow approved BMAD task summaries to be stored in Titan memory.")
     parser.add_argument("--max-revisions", type=int, default=2, help="Maximum BMAD auto-repair cycles.")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors in the terminal interface.")
+    parser.add_argument("--disable-auto-consolidation", action="store_true", help="Disable the startup nightly consolidation check.")
+    parser.add_argument("--consolidation-hour", type=int, default=2, help="Nightly consolidation hour, 0-23. Default: 2.")
+    parser.add_argument("--consolidation-minute", type=int, default=0, help="Nightly consolidation minute. Default: 0.")
+    parser.add_argument("--consolidation-steps", type=int, default=3, help="Number of replay steps for scheduled consolidation.")
+    parser.add_argument("--consolidation-max-items", type=int, default=None, help="Maximum memories replayed by scheduled consolidation.")
+    parser.add_argument("--consolidation-min-hours", type=float, default=20.0, help="Minimum hours between scheduled consolidation runs.")
+    parser.add_argument("--consolidation-log-dir", default=str(ROOT / "logs"), help="Directory for consolidation state and JSONL logs.")
+    parser.add_argument("--force-startup-consolidation", action="store_true", help="Force one consolidation pass when main.py starts. Useful for testing only.")
     return parser
 
 
@@ -486,6 +606,14 @@ def config_from_args(args: argparse.Namespace) -> UnifiedChatConfig:
         store_approved_memory=bool(args.store_approved_memory),
         max_revisions=int(args.max_revisions),
         color_enabled=not bool(args.no_color),
+        auto_consolidation_enabled=not bool(args.disable_auto_consolidation),
+        consolidation_hour=int(args.consolidation_hour),
+        consolidation_minute=int(args.consolidation_minute),
+        consolidation_steps=int(args.consolidation_steps),
+        consolidation_max_items=args.consolidation_max_items,
+        consolidation_min_hours_between_runs=float(args.consolidation_min_hours),
+        consolidation_log_dir=args.consolidation_log_dir,
+        force_startup_consolidation=bool(args.force_startup_consolidation),
     )
 
 

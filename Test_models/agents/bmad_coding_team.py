@@ -58,6 +58,7 @@ if str(ROOT) not in sys.path:
 from tools.docker_tools import create_docker_compose, create_dockerfile, run_commands_in_docker
 from agents.bmad_llm_codegen import AgnoOllamaCodeGenerator, CodeGenerationResult, GeneratedCodeFile, LLMCodeGenerator
 from agents.bmad_templates import build_app_template, build_test_template
+from tools.project_registry import archive_generated_project, build_project_reuse_context, find_generated_projects
 from tools.file_tools import (
     STAGING_DIR,
     WORKSPACE_DIR,
@@ -181,6 +182,8 @@ class TaskSpec:
     behavior_checks: list[BehaviorCheck] = field(default_factory=list)
     memory_context: str = ""
     memory_context_used: bool = False
+    project_reuse_context: str = ""
+    reused_project_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -237,6 +240,7 @@ class BMADResult:
     memory_context: MemoryContext
     memory_candidate: str | None
     memory_validation: MemoryValidationDecision
+    project_archive: dict[str, Any] | None
     final_message: str
     revision_attempts: int = 0
 
@@ -255,13 +259,19 @@ def _slugify(text: str, default: str = "generated_project") -> str:
 
 
 def _workspace_file_list() -> list[str]:
+    """Return current workspace deliverables, excluding persistent archives."""
+
     if not WORKSPACE_DIR.exists():
         return []
-    return sorted(
-        path.relative_to(WORKSPACE_DIR).as_posix()
-        for path in WORKSPACE_DIR.rglob("*")
-        if path.is_file() and path.name != ".gitkeep"
-    )
+    files: list[str] = []
+    for path in WORKSPACE_DIR.rglob("*"):
+        if not path.is_file() or path.name == ".gitkeep":
+            continue
+        relative = path.relative_to(WORKSPACE_DIR)
+        if relative.parts and relative.parts[0] == "projects":
+            continue
+        files.append(relative.as_posix())
+    return sorted(files)
 
 
 def _staging_file_list() -> list[str]:
@@ -669,7 +679,7 @@ class BusinessAgent:
     name = "Business Agent"
     role = "functional specification"
 
-    def define_spec(self, task: str, memory_context: MemoryContext | None = None) -> tuple[TaskSpec, BMADStep]:
+    def define_spec(self, task: str, memory_context: MemoryContext | None = None, project_reuse_context: str = "") -> tuple[TaskSpec, BMADStep]:
         title = _extract_title(task)
         project_name = _slugify(title)
         lower = task.lower()
@@ -690,6 +700,8 @@ class BusinessAgent:
                 requirements.append("Expose a simple command-line entry point.")
         if memory_context and memory_context.enabled:
             requirements.append("Review retrieved Titan memory context in read-only mode before implementation.")
+        if project_reuse_context:
+            requirements.append("Review relevant archived generated projects and reuse their validated structure when useful.")
 
         acceptance_criteria = [
             "app.py exists in staging.",
@@ -702,6 +714,8 @@ class BusinessAgent:
         ]
         if memory_context and memory_context.enabled:
             acceptance_criteria.append("Titan memory context was retrieved in read-only mode and was not modified automatically.")
+        if project_reuse_context:
+            acceptance_criteria.append("Relevant archived project context was reviewed before implementation.")
 
         spec = TaskSpec(
             original_request=task,
@@ -712,18 +726,22 @@ class BusinessAgent:
             project_kind=project_kind,
             cli_examples=_kind_cli_examples(project_kind),
             behavior_checks=_kind_behavior_checks(project_kind),
-            memory_context=memory_context.context if memory_context and memory_context.enabled else "",
-            memory_context_used=bool(memory_context and memory_context.enabled),
+            memory_context=(memory_context.context if memory_context and memory_context.enabled else "")
+            + (("\n\n" + project_reuse_context) if project_reuse_context else ""),
+            memory_context_used=bool(memory_context and memory_context.enabled or project_reuse_context),
+            project_reuse_context=project_reuse_context,
+            reused_project_ids=[str(item.get("project_id")) for item in find_generated_projects(task, limit=3)] if project_reuse_context else [],
         )
         step = BMADStep(
             agent=self.name,
             role=self.role,
             summary=(
                 f"Defined a functional spec for a {kind_label} ('{title}')"
-                + (" using read-only Titan context." if memory_context and memory_context.enabled else ".")
+                + (" using read-only Titan/project context." if (memory_context and memory_context.enabled) or project_reuse_context else ".")
             ),
             actions=["define_goal", "detect_project_template", "define_requirements", "define_acceptance_criteria"]
-            + (["consume_read_only_memory_context"] if memory_context and memory_context.enabled else []),
+            + (["consume_read_only_memory_context"] if memory_context and memory_context.enabled else [])
+            + (["consume_archived_project_context"] if project_reuse_context else []),
         )
         return spec, step
 
@@ -1848,6 +1866,7 @@ class BMADCodingTeam:
         ollama_model: str | None = None,
         llm_fallback_to_template: bool = True,
         max_revision_cycles: int = 1,
+        preserve_project_archives: bool = True,
     ) -> None:
         self.project_manager = ProjectManagerAgent()
         self.business = BusinessAgent()
@@ -1873,6 +1892,7 @@ class BMADCodingTeam:
         self.memory_top_k = int(memory_top_k)
         self.memory_min_score = float(memory_min_score)
         self.max_revision_cycles = max(0, int(max_revision_cycles))
+        self.preserve_project_archives = bool(preserve_project_archives)
 
     @staticmethod
     def _build_code_generator(*, llm_provider: str, ollama_model: str | None) -> LLMCodeGenerator:
@@ -1897,11 +1917,12 @@ class BMADCodingTeam:
             raise ValueError("A non-empty coding task is required.")
 
         memory_context = self._retrieve_memory_context(task)
+        project_reuse_context = self._retrieve_project_reuse_context(task)
 
         steps: list[BMADStep] = []
         steps.append(self.project_manager.start(task, clean_workspace=clean_workspace, memory_context=memory_context))
 
-        spec, business_step = self.business.define_spec(task, memory_context=memory_context)
+        spec, business_step = self.business.define_spec(task, memory_context=memory_context, project_reuse_context=project_reuse_context)
         steps.append(business_step)
         steps.append(self.dev.implement(spec))
         steps.append(self.designer.review(spec))
@@ -1930,13 +1951,36 @@ class BMADCodingTeam:
             publish_result = "Not published because QA/Evaluator rejected the result."
             published = False
 
+        workspace_files_after_publish = _workspace_file_list()
+        project_archive: dict[str, Any] | None = None
+        if published and self.preserve_project_archives:
+            try:
+                manifest = archive_generated_project(
+                    task=task,
+                    project_kind=spec.project_kind,
+                    workspace_files=workspace_files_after_publish,
+                    qa_passed=qa_report.passed,
+                    docker_output=qa_report.docker_output,
+                    manual_test_commands=_manual_test_commands(spec, workspace_files_after_publish),
+                    unit_test_command=spec.test_command,
+                    metadata={
+                        "revision_attempts": revision_attempts,
+                        "memory_context_records": len(memory_context.records),
+                        "reused_project_ids": spec.reused_project_ids,
+                    },
+                )
+                project_archive = manifest.to_dict()
+            except Exception as exc:  # pragma: no cover - archive failures should not block validated output
+                project_archive = {"error": str(exc), "status": "archive_failed"}
+
         memory_candidate = self._build_memory_candidate(
             task=task,
             approved=approved,
             published=published,
-            workspace_files=_workspace_file_list(),
+            workspace_files=workspace_files_after_publish,
             qa_report=qa_report,
             revision_attempts=revision_attempts,
+            project_archive=project_archive,
         )
         memory_validation = self.evaluator.validate_memory_candidate(
             candidate=memory_candidate,
@@ -1961,6 +2005,7 @@ class BMADCodingTeam:
             memory_context=memory_context,
             memory_candidate=memory_candidate,
             memory_validation=memory_validation,
+            project_archive=project_archive,
             final_message="",
             revision_attempts=revision_attempts,
         )
@@ -1978,6 +2023,7 @@ class BMADCodingTeam:
             memory_context,
             memory_candidate,
             memory_validation,
+            project_archive,
             revision_attempts,
             spec,
         )
@@ -1994,6 +2040,7 @@ class BMADCodingTeam:
             memory_context=memory_context,
             memory_candidate=memory_candidate,
             memory_validation=memory_validation,
+            project_archive=project_archive,
             final_message=final_message,
             revision_attempts=revision_attempts,
         )
@@ -2034,6 +2081,21 @@ class BMADCodingTeam:
             min_score=self.memory_min_score,
         )
         return self.memory
+
+
+    @staticmethod
+    def _retrieve_project_reuse_context(task: str) -> str:
+        """Retrieve compact context from validated generated project archives.
+
+        This does not write to Titan. It gives the Dev Agent and optional LLM a
+        stable pointer to previous validated projects so future tasks can reuse
+        existing files instead of always starting from zero.
+        """
+
+        try:
+            return build_project_reuse_context(task, limit=3)
+        except Exception:
+            return ""
 
     def _retrieve_memory_context(self, task: str) -> MemoryContext:
         """Retrieve Titan memory context without writing to long-term memory."""
@@ -2120,15 +2182,30 @@ class BMADCodingTeam:
         workspace_files: Sequence[str],
         qa_report: QAReport,
         revision_attempts: int = 0,
+        project_archive: dict[str, Any] | None = None,
     ) -> str:
         status = "approved" if approved else "rejected"
         files = ", ".join(workspace_files) if workspace_files else "none"
         qa_status = "passed" if qa_report.passed else "failed"
+        archive_text = ""
+        reuse_text = ""
+        if project_archive and isinstance(project_archive.get("metadata"), dict):
+            reused = project_archive.get("metadata", {}).get("reused_project_ids") or []
+            if reused:
+                reuse_text = f" reused_project_ids={', '.join(reused)};"
+        if project_archive and not project_archive.get("error"):
+            archive_text = (
+                f" archived_project_id={project_archive.get('project_id')}; "
+                f"archived_project_path={project_archive.get('project_path')}; "
+                f"main_functions={', '.join(project_archive.get('main_functions') or []) or 'unknown'};"
+            )
         return (
             "Candidate memory only; do not store automatically. "
             f"BMAD coding workflow {status} task={task!r}; "
             f"published={published}; workspace_files={files}; QA={qa_status}; "
-            f"revision_attempts={revision_attempts}."
+            f"revision_attempts={revision_attempts};"
+            f"{archive_text}"
+            f"{reuse_text}"
         )
 
     def _store_validated_memory(self, decision: MemoryValidationDecision) -> MemoryValidationDecision:
@@ -2195,6 +2272,7 @@ class BMADCodingTeam:
         memory_context: MemoryContext,
         memory_candidate: str | None,
         memory_validation: MemoryValidationDecision,
+        project_archive: dict[str, Any] | None = None,
         revision_attempts: int = 0,
         spec: TaskSpec | None = None,
     ) -> str:
@@ -2224,6 +2302,19 @@ class BMADCodingTeam:
         if manual_commands:
             lines.append("Manual test commands:")
             lines.extend(f"- {command}" for command in manual_commands)
+        if project_archive:
+            lines.append("Project archive:")
+            if project_archive.get("error"):
+                lines.append(f"- archive_status: failed ({project_archive.get('error')})")
+            else:
+                lines.append(f"- project_id: {project_archive.get('project_id')}")
+                lines.append(f"- project_path: {project_archive.get('project_path')}")
+                functions = ", ".join(project_archive.get("main_functions") or []) or "unknown"
+                lines.append(f"- main_functions: {functions}")
+                metadata = project_archive.get("metadata") if isinstance(project_archive.get("metadata"), dict) else {}
+                reused = metadata.get("reused_project_ids") or []
+                if reused:
+                    lines.append("- reused_project_ids: " + ", ".join(reused))
         if memory_candidate:
             lines.append("Memory candidate (not stored automatically):")
             lines.append(memory_candidate)
@@ -2252,6 +2343,7 @@ def run_bmad_task(
     ollama_model: str | None = None,
     llm_fallback_to_template: bool = True,
     max_revision_cycles: int = 1,
+    preserve_project_archives: bool = True,
 ) -> BMADResult:
     """Convenience function for scripts and future agent integrations."""
 
@@ -2266,6 +2358,7 @@ def run_bmad_task(
         ollama_model=ollama_model,
         llm_fallback_to_template=llm_fallback_to_template,
         max_revision_cycles=max_revision_cycles,
+        preserve_project_archives=preserve_project_archives,
     ).run(task, run_docker=run_docker, clean_workspace=clean_workspace)
 
 
@@ -2284,6 +2377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ollama-model", default=None, help="Ollama model for Agno generation. Defaults to OLLAMA_MODEL or llama3.2:1b.")
     parser.add_argument("--disable-llm-fallback", action="store_true", help="Reject the workflow if LLM generation fails instead of using deterministic templates.")
     parser.add_argument("--max-revisions", type=int, default=1, help="Maximum automatic repair cycles after QA failure. Default: 1.")
+    parser.add_argument("--disable-project-archive", action="store_true", help="Do not snapshot approved projects into workspace/projects.")
     parser.add_argument("--json", action="store_true", help="Print the full result as JSON.")
     args = parser.parse_args(argv)
 
@@ -2301,6 +2395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ollama_model=args.ollama_model,
         llm_fallback_to_template=not args.disable_llm_fallback,
         max_revision_cycles=args.max_revisions,
+        preserve_project_archives=not args.disable_project_archive,
     )
     if args.json:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
