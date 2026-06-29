@@ -31,8 +31,11 @@ from memory.consolidation_scheduler import ConsolidationPolicy, ConsolidationRun
 from tools.file_tools import clear_staging, clear_workspace, list_staging_files, list_workspace_files  # type: ignore
 from tools.project_registry import (  # type: ignore
     format_project_detail,
+    format_project_file_preview,
+    format_project_integrity_report,
     format_project_search_results,
     list_generated_projects,
+    rebuild_project_index,
 )
 
 
@@ -84,6 +87,7 @@ class UnifiedChatConfig:
     memory_path: str | Path = DEFAULT_MEMORY_PATH
     memory_top_k: int = 5
     memory_min_score: float = 0.12
+    memory_preset: str | None = None
     use_titan_memory: bool = True
     use_llm_for_chat: bool = True
     use_llm_for_coding: bool = True
@@ -98,6 +102,8 @@ class UnifiedChatConfig:
     consolidation_steps: int = int(os.getenv("TITAN_CONSOLIDATION_STEPS", "3"))
     consolidation_max_items: int | None = None
     consolidation_min_hours_between_runs: float = 20.0
+    consolidation_deduplicate_project_memories: bool = True
+    consolidation_keep_latest_project_versions: int = 1
     consolidation_log_dir: str | Path = ROOT / "logs"
     force_startup_consolidation: bool = False
 
@@ -249,10 +255,27 @@ def route_message(message: str) -> RoutedAction:
         return RoutedAction("workspace", "", "workspace keyword")
     if lower in {"projects", "list projects", "generated projects", "project archives", "/projects"}:
         return RoutedAction("projects", "", "generated projects keyword")
+    if lower in {"project integrity", "projects integrity", "archive integrity", "project archive integrity", "/project-integrity"}:
+        return RoutedAction("project_integrity", "", "project archive integrity command")
+    if lower in {"rebuild project index", "rebuild projects index", "rebuild project_index", "/rebuild-project-index"}:
+        return RoutedAction("rebuild_project_index", "", "rebuild project index command")
+    if lower in {"memory project status", "project memory status", "project memory", "memory projects", "/project-memory-status"}:
+        return RoutedAction("project_memory_status", "", "project memory status command")
     if lower.startswith("find project ") or lower.startswith("search project "):
         return RoutedAction("project_search", text.split(" ", 2)[2].strip(), "project archive search")
-    if lower.startswith("show project ") or lower.startswith("project "):
-        return RoutedAction("project_detail", text.split(" ", 2)[2].strip() if lower.startswith("show project ") else text.split(" ", 1)[1].strip(), "project archive detail")
+    if lower.startswith("project file ") or lower.startswith("show project file "):
+        payload = re.sub(r"(?i)^show\s+project\s+file\s+|^project\s+file\s+", "", text).strip()
+        return RoutedAction("project_file", payload, "project archive file preview")
+    if lower.startswith(("reuse project ", "modify project ", "update project ", "extend project ", "improve project ")):
+        return RoutedAction("task", text, "explicit archived project reuse request")
+    if lower.startswith("project "):
+        payload = text.split(" ", 1)[1].strip()
+        reuse_words = (" add ", " change ", " modify ", " update ", " extend ", " improve ", " support ", " to ")
+        if any(word in f" {payload.lower()} " for word in reuse_words):
+            return RoutedAction("task", text, "project-id modification request")
+        return RoutedAction("project_detail", payload, "project archive detail")
+    if lower.startswith("show project "):
+        return RoutedAction("project_detail", text.split(" ", 2)[2].strip(), "project archive detail")
     if lower in {"staging", "list staging", "/staging"}:
         return RoutedAction("staging", "", "staging keyword")
     if lower in {"clear workspace", "/clear-workspace"}:
@@ -299,6 +322,7 @@ class UnifiedChatAssistant:
             memory_path=self.config.memory_path,
             top_k=self.config.memory_top_k,
             min_score=self.config.memory_min_score,
+            memory_preset=self.config.memory_preset,
         )
         self.chat_backend = chat_backend or OllamaChatBackend(self.config.ollama_model)
         self.bmad_runner = bmad_runner
@@ -319,6 +343,7 @@ class UnifiedChatAssistant:
             self._c("MAG Demo AI Coding Assistant", Ansi.CYAN, bold=True) + "\n"
             + self._c("LLM model:", Ansi.BLUE, bold=True) + f" {self.config.ollama_model}\n"
             + self._c("Titan memory:", Ansi.MAGENTA, bold=True) + f" {'enabled' if self.config.use_titan_memory else 'disabled'}\n"
+            + self._c("Titan preset:", Ansi.MAGENTA, bold=True) + f" {self.config.memory_preset or 'small/custom defaults'}\n"
             + self._c("Nightly consolidation:", Ansi.BLUE, bold=True) + f" {self._format_startup_consolidation_inline()}\n"
             + self._c("Docker validation:", Ansi.YELLOW, bold=True) + f" {'enabled' if self.config.run_docker else 'disabled'}\n\n"
             + self._c("Write naturally. Examples:", Ansi.GREEN, bold=True) + "\n"
@@ -339,7 +364,7 @@ class UnifiedChatAssistant:
             + self._c("- Consolidate:", Ansi.BLUE, bold=True) + " 'consolidate memory'.\n"
             + self._c("- Consolidation status:", Ansi.BLUE, bold=True) + " 'consolidation status'.\n\n"
             + self._c("Optional explicit commands still work:", Ansi.GRAY, bold=True) + "\n"
-            + "/task, /code, /store, /ask, /forget, /consolidate, /consolidation-status, /stats, /workspace, /projects, find project ..., project <id>, /staging, /clear-workspace, /clear-staging, /exit."
+            + "/task, /code, /store, /ask, /forget, /consolidate, /consolidation-status, /stats, /workspace, /projects, project integrity, rebuild project index, memory project status, find project ..., project <id>, project file <id> app.py, reuse project <id> ..., /staging, /clear-workspace, /clear-staging, /exit."
         )
 
     def process(self, message: str) -> str:
@@ -358,8 +383,26 @@ class UnifiedChatAssistant:
             return self._c("Workspace files:", Ansi.CYAN, bold=True) + "\n" + self._format_file_list(list_workspace_files())
         if kind == "projects":
             return self._c("Generated project archives:", Ansi.CYAN, bold=True) + "\n" + list_generated_projects()
+        if kind == "project_integrity":
+            return self._c("Project archive integrity:", Ansi.CYAN, bold=True) + "\n" + format_project_integrity_report()
+        if kind == "rebuild_project_index":
+            result = rebuild_project_index(exclude_weak_generic=True)
+            lines = [self._c("Project index rebuilt:", Ansi.CYAN, bold=True)]
+            lines.append(f"- manifests_found: {result.get('manifests_found')}")
+            lines.append(f"- index_entries_written: {result.get('index_entries_written')}")
+            skipped = result.get('weak_generic_archives_skipped') or []
+            lines.append("- weak_generic_archives_skipped: " + (", ".join(skipped) if skipped else "none"))
+            lines.append(f"- index_path: {result.get('index_path')}")
+            return "\n".join(lines)
+        if kind == "project_memory_status":
+            return self._project_memory_status()
         if kind == "project_search":
             return self._c("Generated project search:", Ansi.CYAN, bold=True) + "\n" + format_project_search_results(action.payload)
+        if kind == "project_file":
+            parts = action.payload.split(maxsplit=1)
+            if len(parts) != 2:
+                return self._c("Usage:", Ansi.YELLOW, bold=True) + " project file <project_id> <relative_path>"
+            return self._c("Generated project file:", Ansi.CYAN, bold=True) + "\n" + format_project_file_preview(parts[0], parts[1])
         if kind == "project_detail":
             return self._c("Generated project detail:", Ansi.CYAN, bold=True) + "\n" + format_project_detail(action.payload)
         if kind == "staging":
@@ -398,6 +441,8 @@ class UnifiedChatAssistant:
             log_path=log_dir / "consolidation_log.jsonl",
             keep_existing_ltm=True,
             include_inactive=False,
+            deduplicate_project_memories=bool(self.config.consolidation_deduplicate_project_memories),
+            keep_latest_project_versions_per_kind=int(self.config.consolidation_keep_latest_project_versions),
             save_after=True,
         )
 
@@ -499,6 +544,38 @@ class UnifiedChatAssistant:
         if project_fallback:
             lines.append("")
             lines.append(project_fallback)
+        return "\n".join(lines)
+
+    def _project_memory_status(self) -> str:
+        """Report the consistency between archives and Titan project memories."""
+
+        archive_report = format_project_integrity_report()
+        lines = [self._c("Project memory status:", Ansi.CYAN, bold=True)]
+        if not self.config.use_titan_memory:
+            lines.append("Titan memory is disabled.")
+            lines.append(archive_report)
+            return "\n".join(lines)
+
+        stats = self.memory.stats()
+        lines.append(f"- active_items: {stats.get('active_items')}")
+        lines.append(f"- inactive_items: {stats.get('inactive_items')}")
+        project_active = 0
+        project_inactive = 0
+        try:
+            raw_memory = getattr(self.memory, "memory", None)
+            active_items = getattr(raw_memory, "active_items", []) or []
+            inactive_items = getattr(raw_memory, "inactive_items", []) or []
+            def is_project_item(item: object) -> bool:
+                text = str(getattr(item, "text", "")).lower()
+                return "generated project" in text or "workspace/projects" in text or "validated generated project" in text
+            project_active = sum(1 for item in active_items if is_project_item(item))
+            project_inactive = sum(1 for item in inactive_items if is_project_item(item))
+        except Exception:
+            project_active = -1
+            project_inactive = -1
+        lines.append(f"- active_project_memory_items: {project_active}")
+        lines.append(f"- inactive_project_memory_items: {project_inactive}")
+        lines.append(archive_report)
         return "\n".join(lines)
 
     def _recall_project_archives(self, query: str) -> str:
@@ -621,6 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MAG Demo unified AI coding assistant.")
     parser.add_argument("--ollama-model", default=DEFAULT_MODEL, help="Ollama model for normal chat and BMAD LLM generation.")
     parser.add_argument("--memory-path", default=DEFAULT_MEMORY_PATH, help="Titan memory file used by the unified chat.")
+    parser.add_argument("--memory-preset", choices=["small", "medium", "large", "research"], default=None, help="Titan memory size preset. Default keeps current small/custom settings.")
     parser.add_argument("--memory-top-k", type=int, default=5, help="Number of memories to retrieve.")
     parser.add_argument("--memory-min-score", type=float, default=0.12, help="Minimum Titan retrieval score.")
     parser.add_argument("--disable-titan-memory", action="store_true", help="Disable Titan memory for this session.")
@@ -637,6 +715,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--consolidation-steps", type=int, default=3, help="Number of replay steps for scheduled consolidation.")
     parser.add_argument("--consolidation-max-items", type=int, default=None, help="Maximum memories replayed by scheduled consolidation.")
     parser.add_argument("--consolidation-min-hours", type=float, default=20.0, help="Minimum hours between scheduled consolidation runs.")
+    parser.add_argument("--disable-project-memory-dedup", action="store_true", help="Do not deactivate older generated-project memory records during consolidation.")
+    parser.add_argument("--keep-latest-project-versions", type=int, default=1, help="Active generated-project versions to keep per project kind during consolidation.")
     parser.add_argument("--consolidation-log-dir", default=str(ROOT / "logs"), help="Directory for consolidation state and JSONL logs.")
     parser.add_argument("--force-startup-consolidation", action="store_true", help="Force one consolidation pass when main.py starts. Useful for testing only.")
     return parser
@@ -646,6 +726,7 @@ def config_from_args(args: argparse.Namespace) -> UnifiedChatConfig:
     return UnifiedChatConfig(
         ollama_model=args.ollama_model,
         memory_path=args.memory_path,
+        memory_preset=args.memory_preset,
         memory_top_k=args.memory_top_k,
         memory_min_score=args.memory_min_score,
         use_titan_memory=not args.disable_titan_memory,
@@ -662,6 +743,8 @@ def config_from_args(args: argparse.Namespace) -> UnifiedChatConfig:
         consolidation_steps=int(args.consolidation_steps),
         consolidation_max_items=args.consolidation_max_items,
         consolidation_min_hours_between_runs=float(args.consolidation_min_hours),
+        consolidation_deduplicate_project_memories=not bool(args.disable_project_memory_dedup),
+        consolidation_keep_latest_project_versions=int(args.keep_latest_project_versions),
         consolidation_log_dir=args.consolidation_log_dir,
         force_startup_consolidation=bool(args.force_startup_consolidation),
     )

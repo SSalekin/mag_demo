@@ -61,6 +61,7 @@ from agents.bmad_templates import build_app_template, build_test_template
 from tools.project_registry import (
     archive_generated_project,
     build_project_reuse_context,
+    extract_project_id_from_text,
     find_generated_projects,
     restore_project_to_staging,
     select_project_for_reuse,
@@ -739,9 +740,18 @@ class BusinessAgent:
         lower = task.lower()
         memory_text = memory_context.context.lower() if memory_context and memory_context.enabled else ""
         project_kind = _detect_project_kind(task)
-        kind_label = _kind_label(project_kind)
         reuse_candidates = find_generated_projects(task, limit=3) if project_reuse_context else []
+        explicit_project_id = extract_project_id_from_text(task)
         base_project = reuse_candidates[0] if (_is_project_reuse_request(task) and reuse_candidates) else None
+        # If the user references a project id and the task itself is generic
+        # (e.g. "modify project <id> to add median"), inherit the archived
+        # project kind so the Dev Agent modifies the right type of app instead
+        # of falling back to a generic placeholder.
+        if base_project and project_kind == "generic":
+            inherited_kind = str(base_project.get("project_kind") or "").strip()
+            if inherited_kind:
+                project_kind = inherited_kind
+        kind_label = _kind_label(project_kind)
         reuse_mode = "modify_existing" if base_project else ("context_only" if reuse_candidates else "none")
 
         requirements = [
